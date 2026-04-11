@@ -1,0 +1,154 @@
+@import "@fontsource/chakra-petch/latin-500.css";
+@import "@fontsource/chakra-petch/latin-600.css";
+@import "@fontsource/chakra-petch/latin-700.css";
+@import "@fontsource/public-sans/latin-400.css";
+@import "@fontsource/public-sans/latin-500.css";
+@import "@fontsource/public-sans/latin-600.css";
+@import "@fontsource/public-sans/latin-700.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-500.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-intense: #0d0d0d;
+  --bg-anthracite: #262626;
+  --bg-medium: #737373;
+  --bg-light: #f2f2f2;
+  --accent-purple: #200f38;
+  --line: rgba(242, 242, 242, 0.16);
+  --line-strong: rgba(242, 242, 242, 0.28);
+  --text-main: #f2f2f2;
+  --text-muted: #b8b8b8;
+}
+
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html,
+  body,
+  #root,
+  #admin-root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-family: "Public Sans", sans-serif;
+    color: var(--text-main);
+    background:
+      radial-gradient(circle at 72% -10%, rgba(32, 15, 56, 0.35), transparent 44%),
+      radial-gradient(circle at 10% 0%, rgba(242, 242, 242, 0.06), transparent 32%),
+      linear-gradient(165deg, var(--bg-intense) 0%, #111111 58%, #1a1a1a 100%);
+    line-height: 1.55;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  .font-display {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 600;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: "IBM Plex Mono", monospace;
+  }
+
+  a {
+    color: inherit;
+  }
+
+  [hidden] {
+    display: none !important;
+  }
+
+  ::selection {
+    background: rgba(32, 15, 56, 0.6);
+    color: #ffffff;
+  }
+}
+
+@layer components {
+  .app-canvas {
+    position: relative;
+    background:
+      radial-gradient(860px 420px at 88% 8%, rgba(32, 15, 56, 0.26), transparent 62%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.012), rgba(255, 255, 255, 0));
+  }
+
+  .app-canvas::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(300px 170px at 78% 90px, rgba(242, 242, 242, 0.08), transparent 74%),
+      linear-gradient(90deg, rgba(242, 242, 242, 0.018) 1px, transparent 1px),
+      linear-gradient(rgba(242, 242, 242, 0.018) 1px, transparent 1px);
+    background-size:
+      auto,
+      34px 34px,
+      34px 34px;
+    mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.96), rgba(0, 0, 0, 0.4) 70%, rgba(0, 0, 0, 0));
+    -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.96), rgba(0, 0, 0, 0.4) 70%, rgba(0, 0, 0, 0));
+  }
+
+  .hero-frame {
+    position: relative;
+    overflow: hidden;
+    background:
+      linear-gradient(150deg, rgba(18, 18, 18, 0.96) 0%, rgba(28, 28, 28, 0.9) 72%),
+      radial-gradient(circle at 92% 0%, rgba(32, 15, 56, 0.34), transparent 42%);
+    box-shadow: inset 0 1px 0 rgba(242, 242, 242, 0.07), 0 26px 64px rgba(0, 0, 0, 0.58);
+  }
+
+  .hero-frame::after {
+    content: "";
+    position: absolute;
+    right: 20px;
+    top: 14px;
+    width: 88px;
+    height: 88px;
+    border: 1px solid rgba(242, 242, 242, 0.12);
+    background: linear-gradient(rgba(242, 242, 242, 0.07), rgba(242, 242, 242, 0.01));
+    clip-path: polygon(0 0, 100% 0, 100% 100%, 58% 100%, 58% 72%, 34% 72%, 34% 100%, 0 100%);
+    opacity: 0.4;
+    transform: rotate(7deg);
+    pointer-events: none;
+  }
+
+  .bg-grid-overlay {
+    background-image:
+      linear-gradient(rgba(242, 242, 242, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(242, 242, 242, 0.025) 1px, transparent 1px);
+    background-size: 36px 36px;
+    mask-image: radial-gradient(circle at 50% 25%, rgba(0, 0, 0, 0.88), rgba(0, 0, 0, 0));
+    -webkit-mask-image: radial-gradient(circle at 50% 25%, rgba(0, 0, 0, 0.88), rgba(0, 0, 0, 0));
+  }
+
+  .toast-in {
+    animation: toast-in 180ms ease;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}

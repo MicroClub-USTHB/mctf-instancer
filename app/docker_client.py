@@ -448,6 +448,118 @@ class DockerClient:
             ]
         
         return await loop.run_in_executor(None, _list)
+
+    async def list_compose_projects(self) -> List[Dict[str, Any]]:
+        """List docker-compose projects discovered from container labels."""
+        loop = asyncio.get_event_loop()
+
+        def _list() -> List[Dict[str, Any]]:
+            projects: Dict[str, Dict[str, Any]] = {}
+            containers = self.client.containers.list(
+                all=True,
+                filters={"label": "com.docker.compose.project"},
+            )
+
+            for container in containers:
+                labels = container.labels or {}
+                project_name = labels.get("com.docker.compose.project")
+                if not project_name:
+                    continue
+
+                project = projects.setdefault(
+                    project_name,
+                    {
+                        "project_name": project_name,
+                        "container_ids": [],
+                        "container_names": [],
+                        "labels": [],
+                    },
+                )
+                project["container_ids"].append(container.id)
+                project["container_names"].append(container.name)
+                project["labels"].append(labels)
+
+            return list(projects.values())
+
+        return await loop.run_in_executor(None, _list)
+
+    async def remove_compose_project(self, project_name: str, remove_volumes: bool = True) -> Dict[str, int]:
+        """Force-remove all resources belonging to a docker-compose project."""
+        loop = asyncio.get_event_loop()
+
+        def _remove() -> Dict[str, int]:
+            cleaned = {
+                "containers": 0,
+                "networks": 0,
+                "volumes": 0,
+                "images": 0,
+            }
+
+            containers = self.client.containers.list(
+                all=True,
+                filters={"label": f"com.docker.compose.project={project_name}"},
+            )
+            for container in containers:
+                try:
+                    container.remove(force=True, v=remove_volumes)
+                    cleaned["containers"] += 1
+                except NotFound:
+                    continue
+                except APIError as exc:
+                    print(f"[Docker] Warning: failed to remove container {container.name}: {exc}")
+
+            networks = self.client.networks.list(
+                filters={"label": f"com.docker.compose.project={project_name}"}
+            )
+            for network in networks:
+                try:
+                    network.remove()
+                    cleaned["networks"] += 1
+                except APIError:
+                    try:
+                        for attached in network.containers:
+                            network.disconnect(attached, force=True)
+                        network.remove()
+                        cleaned["networks"] += 1
+                    except Exception as exc:
+                        print(f"[Docker] Warning: failed to remove network {network.name}: {exc}")
+
+            if remove_volumes:
+                try:
+                    volumes = self.client.volumes.list(
+                        filters={"label": f"com.docker.compose.project={project_name}"}
+                    )
+                except Exception:
+                    volumes = []
+
+                for volume in volumes:
+                    try:
+                        volume.remove(force=True)
+                        cleaned["volumes"] += 1
+                    except APIError as exc:
+                        print(f"[Docker] Warning: failed to remove volume {volume.name}: {exc}")
+
+            # Per-spawn images: tag pattern is "<project>-<service>:latest".
+            # Only remove images whose name starts with this exact project prefix.
+            # Base/pulled images (nginx:alpine, python:..., ubuntu:...) never match.
+            try:
+                for image in self.client.images.list():
+                    for tag in (image.tags or []):
+                        if tag.startswith(f"{project_name}-"):
+                            try:
+                                self.client.images.remove(tag, force=True)
+                                cleaned["images"] += 1
+                            except (NotFound, ImageNotFound):
+                                pass
+                            except APIError as exc:
+                                print(f"[Docker] Warning: failed to remove image {tag}: {exc}")
+                            break  # don't double-count multi-tag images
+            except Exception as exc:
+                print(f"[Docker] Warning: per-spawn image scan failed for {project_name}: {exc}")
+
+            return cleaned
+
+        return await loop.run_in_executor(None, _remove)
     
     # ==================== Compose-like Operations ====================
     
@@ -591,39 +703,114 @@ class DockerClient:
     
     async def cleanup_whaley_resources(
         self,
-        older_than_hours: int = 24
+        active_project_names: Optional[set] = None,
+        older_than_seconds: int = 300,
     ) -> Dict[str, int]:
         """
-        Cleanup orphaned Whaley resources (networks, containers).
-        
-        Returns:
-            Count of cleaned resources
+        Sweep orphaned Whaley resources (networks + per-spawn images) that
+        no longer correspond to an active instance.
+
+        active_project_names: caller-supplied set of project names that ARE
+            currently active; anything not in here may be orphan. If None,
+            falls back to label-based detection only.
+        older_than_seconds: safety window — never remove resources younger
+            than this. Avoids killing in-flight spawns.
         """
         from datetime import timedelta
-        
+
         loop = asyncio.get_event_loop()
-        cleaned = {"networks": 0, "containers": 0}
-        
+        cleaned = {"networks": 0, "images": 0}
+        active = set(active_project_names or ())
+
+        def _project_from_network(name: str) -> Optional[str]:
+            # Compose creates "<project>_<network-name>" (most often "<project>_default").
+            # Whaley's labeled isolated network is "whaley-<project>".
+            if name.startswith("whaley-"):
+                return name[len("whaley-"):]
+            if "_" in name:
+                # Strip last underscore segment (network name like "default" or "local_network")
+                return name.rsplit("_", 1)[0] if name.endswith("_default") else None
+            return None
+
         def _cleanup():
-            cutoff = datetime.utcnow() - timedelta(hours=older_than_hours)
-            
-            # Cleanup orphaned networks
-            networks = self.client.networks.list(
-                filters={"label": "whaley.managed=true"}
-            )
-            for network in networks:
-                created_at_str = network.attrs.get("Labels", {}).get("whaley.created_at")
-                if created_at_str:
+            cutoff = datetime.utcnow() - timedelta(seconds=older_than_seconds)
+
+            # Reserved network names we never touch.
+            reserved = {"bridge", "host", "none", "ctf-instances",
+                        "mctf-monitoring_default", "whaley-redis", "whaley_default"}
+
+            # === Orphan networks ===
+            for network in self.client.networks.list():
+                name = network.name
+                if name in reserved:
+                    continue
+                project = _project_from_network(name)
+                if not project:
+                    continue
+                if project in active:
+                    continue
+                # Skip if any container still attached
+                if len(network.containers) > 0:
+                    continue
+                # Safety window via Created timestamp
+                created_str = network.attrs.get("Created")
+                if created_str:
                     try:
-                        created_at = datetime.fromisoformat(created_at_str)
-                        if created_at < cutoff and len(network.containers) == 0:
-                            network.remove()
-                            cleaned["networks"] += 1
+                        # Docker returns RFC3339 like "2026-04-30T20:47:22.866Z"
+                        created = datetime.fromisoformat(created_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                        if created > cutoff:
+                            continue  # too young, leave alone
                     except Exception:
                         pass
-            
+                try:
+                    network.remove()
+                    cleaned["networks"] += 1
+                except APIError as exc:
+                    print(f"[Docker] orphan network {name} remove failed: {exc}")
+
+            # === Orphan per-spawn images ===
+            for image in self.client.images.list():
+                tags = image.tags or []
+                if not tags:
+                    continue
+                # Image is per-spawn iff every tag matches "<active-or-stale-project>-<service>:..."
+                for tag in tags:
+                    # Skip obvious base/pulled images
+                    if "/" in tag.split(":", 1)[0]:
+                        # e.g. docker.io/library/...
+                        continue
+                    # Tag must look like "<project>-<service>:tag"
+                    bare = tag.split(":", 1)[0]
+                    if "-" not in bare:
+                        continue
+                    # Project name pattern from Whaley: <challenge-id>-<num>-<8+hex>
+                    import re
+                    m = re.match(r"^([a-z0-9]+(?:-[a-z0-9]+)*?-\d+-[a-f0-9]{6,})-[a-z0-9_-]+$", bare)
+                    if not m:
+                        continue
+                    project = m.group(1)
+                    if project in active:
+                        break  # active, skip whole image
+                    # Safety window via image Created
+                    try:
+                        created_str = image.attrs.get("Created", "")
+                        if created_str:
+                            created = datetime.fromisoformat(created_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                            if created > cutoff:
+                                break
+                    except Exception:
+                        pass
+                    try:
+                        self.client.images.remove(tag, force=True)
+                        cleaned["images"] += 1
+                    except (NotFound, ImageNotFound):
+                        pass
+                    except APIError as exc:
+                        print(f"[Docker] orphan image {tag} remove failed: {exc}")
+                    break  # don't double-count multi-tag images
+
             return cleaned
-        
+
         return await loop.run_in_executor(None, _cleanup)
 
 

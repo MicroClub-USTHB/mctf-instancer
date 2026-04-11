@@ -1,0 +1,10 @@
+id = "example-ssh"
+name = "Example ssh Challenge"
+category = "pwn"
+type = "tcp"
+description = "A simple ssh challenge, password is mctf5"
+
+ports = [22]
+timeout = 1800
+extend_time = 900 
+connection_command = 'ssh -o ProxyCommand="openssl s_client -quiet -connect {host}:{port}" mctf@{host} -p {port}'

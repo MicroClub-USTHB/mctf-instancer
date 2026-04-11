@@ -80,7 +80,17 @@ class Settings(BaseSettings):
     
     # Admin dashboard settings
     ADMIN_KEY: Optional[str] = None  # Secret key for admin dashboard access
-    
+    METRICS_SECRET: Optional[str] = None  # Bearer secret for /metrics endpoint
+    DISCORD_WEBHOOK_URL: Optional[str] = None  # Discord webhook for lifecycle notifications
+
+    # URL path segment under which the admin dashboard HTML is served.
+    # Set to a hard-to-guess token (e.g. ADMIN_PATH=admin-<hex>) to keep the
+    # dashboard URL out of crawlers / wordlists. Default "admin" preserves
+    # backward compatibility. Note: this only hides the dashboard *page* —
+    # the /admin/api/* endpoints still live at their canonical paths and are
+    # protected by ADMIN_KEY + per-IP rate limit, not by URL obscurity.
+    ADMIN_PATH: str = "admin"
+
     # Rate limiting for admin endpoints (requests per minute)
     ADMIN_RATE_LIMIT: int = 150  # Max requests per minute per IP
     
@@ -100,7 +110,7 @@ class Settings(BaseSettings):
     # Trusted proxies for X-Forwarded-For header
     # Only trust these IPs to set forwarded headers (prevents IP spoofing)
     # Use comma-separated values, e.g., "127.0.0.1,10.0.0.1" or "*" to trust all (not recommended)
-    TRUSTED_PROXIES: str = "127.0.0.1,::1"
+    TRUSTED_PROXIES: str = "127.0.0.1,::1,10.0.0.2"
     
     # Challenge configs directory
     CHALLENGES_DIR: str = "/challenges"
@@ -111,6 +121,22 @@ class Settings(BaseSettings):
     
     # Redis for distributed locking and state management
     REDIS_URL: Optional[str] = None  # e.g., redis://localhost:6379/0
+
+    # Traefik Redis KV provider settings
+    TRAEFIK_REDIS_ENABLED: bool = True
+    TRAEFIK_REDIS_URL: Optional[str] = None  # Falls back to REDIS_URL when empty
+    TRAEFIK_REDIS_KEY_PREFIX: str = "traefik"
+    TRAEFIK_BASE_DOMAIN: str = "ctf.example"
+    TRAEFIK_BACKEND_HOST: str = "challenges-vm"
+    TRAEFIK_HTTP_ENTRYPOINT: str = "websecure"
+    TRAEFIK_TCP_ENTRYPOINT: str = "tcp-challenges"
+    TRAEFIK_TCP_EXTERNAL_PORT: int = 5443
+    TRAEFIK_HTTP_TLS_OPTIONS: str = "default"
+    TRAEFIK_TCP_TLS_OPTIONS: str = "default"
+    TRAEFIK_BLOCK_ALL_ADDRESS: str = "127.0.0.1:9"
+    TRAEFIK_DASHBOARD_USERS: Optional[str] = None
+    TRAEFIK_PERMANENT_KEYS_FILE: Optional[str] = None
+    TRAEFIK_PERMANENT_KEYS_JSON: Optional[str] = None
     
     # Network isolation settings
     NETWORK_ISOLATION_ENABLED: bool = True  # Create isolated network per instance
@@ -129,6 +155,14 @@ class Settings(BaseSettings):
         if self.PUBLIC_HOST and self.PUBLIC_HOST.lower() not in ("auto", ""):
             return self.PUBLIC_HOST
         return get_public_ip()
+
+    def get_traefik_redis_url(self) -> Optional[str]:
+        """Resolve Traefik Redis URL with REDIS_URL fallback."""
+        return self.TRAEFIK_REDIS_URL or self.REDIS_URL
+
+    def get_instance_domain(self, instance_id: str) -> str:
+        """Build instance FQDN using the configured base domain."""
+        return f"{instance_id}.{self.TRAEFIK_BASE_DOMAIN}"
     
     class Config:
         env_file = ".env"

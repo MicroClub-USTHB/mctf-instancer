@@ -1,34 +1,48 @@
 """Main FastAPI application for the CTF Docker Instancer."""
+import hmac
 import os
+import re
 import shutil
 import zipfile
 import tempfile
 import time
 import asyncio
 import ipaddress
+import tomllib
 from collections import defaultdict
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, UploadFile, File, Form
+from typing import Optional, List, Dict, Tuple, Any
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, UploadFile, File, Form, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials
 
 from .config import settings, Settings
 from .models import (
-    UserInfo, SpawnRequest, SpawnResponse, 
-    InstanceListResponse, ChallengeListResponse, Instance
+    UserInfo,
+    SpawnRequest,
+    Instance,
+    PublicChallengeInfo,
+    PublicChallengeListResponse,
+    PublicInstance,
+    PublicInstanceListResponse,
+    PublicMeResponse,
+    PublicSpawnResponse,
+    PublicUserInfo,
 )
 from .auth import get_current_user, init_auth, init_team_mode, is_team_mode, ctfd_auth, security
+from .websocket import get_ws_manager
 from .port_manager import PortManager
 from .docker_manager import DockerManager
 from .logger import get_event_logger, init_event_logger, EventType
+from .discord_webhook import get_discord_notifier
 from .flag_manager import get_flag_manager
 from .forensics import get_forensics_manager
 from .database.connection import init_database, close_database
 from .distributed_lock import init_lock_manager, close_lock_manager
+from .traefik_redis import init_traefik_provider, close_traefik_provider
 
 
 # Global managers
@@ -59,6 +73,212 @@ MAX_EXTRACTED_SIZE = 200 * 1024 * 1024  # 200MB total extracted
 # Background task for auto-checking submissions
 _submission_check_task: Optional[asyncio.Task] = None
 SUBMISSION_CHECK_INTERVAL = 60  # Check every 60 seconds (1 minute)
+
+# Runtime metrics state for high-frequency operational observability.
+SPAWN_LATENCY_BUCKETS_SECONDS = (0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0)
+_spawn_inflight_requests = 0
+_spawn_latency_sum_seconds = 0.0
+_spawn_latency_count = 0
+_spawn_latency_bucket_counts: Dict[float, int] = defaultdict(int)
+_runtime_operation_counters: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
+
+for _spawn_bucket in SPAWN_LATENCY_BUCKETS_SECONDS:
+    _spawn_latency_bucket_counts[_spawn_bucket] = 0
+
+
+def _normalize_reason_label(reason: Optional[str]) -> str:
+    """Normalize arbitrary reason strings into stable Prometheus label values."""
+    raw_reason = (reason or "none").strip().lower()
+    if not raw_reason:
+        return "none"
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", raw_reason)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized:
+        return "unknown"
+    return normalized[:64]
+
+
+def _classify_spawn_failure_reason(message: str) -> str:
+    """Bucket spawn failures into low-cardinality operational reasons."""
+    lowered = (message or "").lower()
+
+    if "rate limit" in lowered:
+        return "rate_limited"
+    if "currently inactive" in lowered:
+        return "challenge_inactive"
+    if "challenge not found" in lowered:
+        return "challenge_not_found"
+    if "maximum instance" in lowered:
+        return "instance_limit_reached"
+    if "already has this challenge running" in lowered:
+        return "challenge_already_running"
+    if "no exposed ports" in lowered:
+        return "challenge_ports_missing"
+    if "no available ports" in lowered:
+        return "port_pool_exhausted"
+    if "failed to determine backend port" in lowered:
+        return "routing_backend_port_missing"
+    if "docker-compose failed" in lowered:
+        return "docker_compose_failed"
+    if "timeout" in lowered:
+        return "timeout"
+    if "failed to start instance" in lowered:
+        return "instance_start_failed"
+
+    return "unknown"
+
+
+def _classify_operation_failure_reason(message: str) -> str:
+    """Bucket stop/extend failures for alerting-friendly metrics."""
+    lowered = (message or "").lower()
+
+    if "rate limit" in lowered:
+        return "rate_limited"
+    if "instance not found" in lowered:
+        return "instance_not_found"
+    if "doesn't own this instance" in lowered or "don't own this instance" in lowered:
+        return "access_denied"
+    if "challenge configuration not found" in lowered:
+        return "challenge_config_missing"
+    if "only running instances can be extended" in lowered:
+        return "invalid_instance_state"
+    if "extension is disabled" in lowered:
+        return "extension_disabled"
+    if "extension available in" in lowered:
+        return "extension_too_early"
+    if "extension limit reached" in lowered:
+        return "extension_limit_reached"
+    if "failed to stop instance" in lowered:
+        return "instance_stop_failed"
+
+    return "unknown"
+
+
+def _record_runtime_operation(
+    operation: str,
+    outcome: str,
+    challenge_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> None:
+    """Track request outcomes for near-real-time SLO and failure dashboards."""
+    key = (
+        (operation or "unknown").strip().lower(),
+        (outcome or "unknown").strip().lower(),
+        _normalize_reason_label(reason),
+        str(challenge_id or "unknown"),
+    )
+    _runtime_operation_counters[key] += 1
+
+
+def _spawn_started() -> None:
+    """Track an in-flight spawn request."""
+    global _spawn_inflight_requests
+    _spawn_inflight_requests += 1
+
+
+def _spawn_finished(duration_seconds: float) -> None:
+    """Record spawn latency histogram and decrement in-flight counter."""
+    global _spawn_inflight_requests, _spawn_latency_sum_seconds, _spawn_latency_count
+
+    _spawn_inflight_requests = max(0, _spawn_inflight_requests - 1)
+    observed = max(0.0, float(duration_seconds))
+    _spawn_latency_sum_seconds += observed
+    _spawn_latency_count += 1
+
+    for bucket in SPAWN_LATENCY_BUCKETS_SECONDS:
+        if observed <= bucket:
+            _spawn_latency_bucket_counts[bucket] += 1
+
+
+def _to_public_challenge(challenge_info) -> PublicChallengeInfo:
+    """Build sanitized challenge payload for normal users."""
+    return PublicChallengeInfo(
+        id=challenge_info.id,
+        name=challenge_info.name,
+        category=challenge_info.category,
+        routing_type=challenge_info.routing_type,
+        tls_enabled=challenge_info.tls_enabled,
+        description=challenge_info.description,
+    )
+
+
+def _to_public_instance(instance: Instance) -> PublicInstance:
+    """Build sanitized instance payload for normal users."""
+    # Expose endpoints as plain URLs only (no internal service-port keys).
+    public_urls = list((instance.public_urls or {}).values())
+
+    return PublicInstance(
+        instance_id=instance.instance_id,
+        challenge_id=instance.challenge_id,
+        username=instance.username,
+        team_name=instance.team_name,
+        routing_type=instance.routing_type,
+        connection_hint=instance.connection_hint,
+        status=instance.status,
+        created_at=instance.created_at,
+        expires_at=instance.expires_at,
+        public_url=instance.public_url,
+        public_urls=public_urls,
+    )
+
+
+def _sanitize_user_error_message(message: str, fallback: str) -> str:
+    """Prevent leaking backend/docker internals in user-visible error details."""
+    lowered = (message or "").lower()
+    internal_markers = (
+        "docker",
+        "compose",
+        "traefik",
+        "network",
+        "traceback",
+        "port is already allocated",
+        "address already in use",
+        "failed to start instance:",
+        "failed to stop instance:",
+    )
+    if any(marker in lowered for marker in internal_markers):
+        return fallback
+    return message or fallback
+
+
+SENSITIVE_SETTING_KEYS = {
+    "ADMIN_KEY",
+    "CTFD_API_KEY",
+    "DISCORD_WEBHOOK_URL",
+}
+SENSITIVE_SETTING_KEYWORDS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "WEBHOOK",
+)
+
+
+def _is_sensitive_setting_key(key: str) -> bool:
+    """Classify settings keys that should never have raw values in logs."""
+    normalized = (key or "").strip().upper()
+    if not normalized:
+        return False
+
+    if normalized in SENSITIVE_SETTING_KEYS:
+        return True
+
+    if normalized.endswith("_KEY"):
+        return True
+
+    return any(keyword in normalized for keyword in SENSITIVE_SETTING_KEYWORDS)
+
+
+def _build_settings_audit_details(applied: Dict[str, object]) -> Dict[str, object]:
+    """Build metadata-only audit details for settings updates."""
+    applied_keys = sorted(applied.keys())
+    sensitive_keys = [key for key in applied_keys if _is_sensitive_setting_key(key)]
+    return {
+        "applied_keys": applied_keys,
+        "applied_count": len(applied_keys),
+        "sensitive_keys_redacted": sensitive_keys,
+    }
 
 
 def _get_trusted_proxies() -> set:
@@ -129,6 +349,98 @@ def check_user_rate_limit(user_id: str) -> bool:
     return True
 
 
+def _extract_bearer_token(authorization_header: Optional[str]) -> Optional[str]:
+    """Extract bearer token from Authorization header."""
+    if not authorization_header:
+        return None
+
+    prefix = "bearer "
+    if authorization_header.lower().startswith(prefix):
+        token = authorization_header[len(prefix):].strip()
+        return token or None
+
+    return None
+
+
+def _escape_prometheus_label_value(value: str) -> str:
+    """Escape a Prometheus label value according to text exposition format."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
+
+
+def _format_prometheus_sample(
+    metric: str,
+    value: float,
+    labels: Optional[Dict[str, str]] = None,
+) -> str:
+    """Format a single Prometheus metric sample line."""
+    if labels:
+        label_pairs = ",".join(
+            f'{key}="{_escape_prometheus_label_value(str(val))}"'
+            for key, val in sorted(labels.items())
+        )
+        return f"{metric}{{{label_pairs}}} {value:g}"
+
+    return f"{metric} {value:g}"
+
+
+def _infer_instance_connection_labels(instance: Instance) -> Dict[str, str]:
+    """Infer stable routing/connection labels for a spawned instance."""
+    routing_type = str(getattr(instance, "routing_type", None) or "unknown").strip().lower()
+    connection_hint = str(getattr(instance, "connection_hint", None) or "").strip().lower()
+    public_url = str(getattr(instance, "public_url", None) or "").strip().lower()
+
+    if routing_type in ("http", "https"):
+        if public_url.startswith("https://") or "https://" in connection_hint:
+            connection_type = "https"
+        else:
+            connection_type = "http"
+    elif routing_type == "tcp":
+        connection_type = "tcp_tls" if ("--ssl" in connection_hint or "tls" in connection_hint) else "tcp_plain"
+    else:
+        if public_url.startswith("https://"):
+            connection_type = "https"
+        elif public_url.startswith("http://"):
+            connection_type = "http"
+        else:
+            connection_type = routing_type
+
+    return {
+        "routing_type": routing_type or "unknown",
+        "connection_type": connection_type or "unknown",
+    }
+
+
+def verify_metrics_secret(
+    authorization: Optional[str] = Header(None),
+    x_metrics_secret: Optional[str] = Header(None),
+) -> bool:
+    """Verify secret for Prometheus metrics endpoint access."""
+    configured_secret = (settings.METRICS_SECRET or "").strip()
+    if not configured_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics endpoint disabled (METRICS_SECRET not configured)",
+        )
+
+    provided_secret = (
+        (x_metrics_secret or "").strip()
+        or (_extract_bearer_token(authorization) or "").strip()
+    )
+
+    if not provided_secret or not hmac.compare_digest(provided_secret, configured_secret):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return True
+
+
 async def _load_settings_from_db():
     """Load persisted settings overrides from database on startup."""
     # Map of setting types for proper casting
@@ -143,11 +455,27 @@ async def _load_settings_from_db():
         "FORENSICS_AUTO_CAPTURE": lambda v: str(v).lower() in ("true", "1", "yes"),
         "FORENSICS_RETENTION_HOURS": int,
         "PUBLIC_HOST": str,
+
+        # Traefik Redis routing settings
+        "TRAEFIK_REDIS_ENABLED": lambda v: str(v).lower() in ("true", "1", "yes"),
+        "TRAEFIK_REDIS_URL": str,
+        "TRAEFIK_BASE_DOMAIN": str,
+        "TRAEFIK_BACKEND_HOST": str,
+        "TRAEFIK_HTTP_ENTRYPOINT": str,
+        "TRAEFIK_TCP_ENTRYPOINT": str,
+        "TRAEFIK_TCP_EXTERNAL_PORT": int,
+        "TRAEFIK_HTTP_TLS_OPTIONS": str,
+        "TRAEFIK_TCP_TLS_OPTIONS": str,
+        "TRAEFIK_BLOCK_ALL_ADDRESS": str,
+        "TRAEFIK_DASHBOARD_USERS": str,
+        "TRAEFIK_PERMANENT_KEYS_FILE": str,
+        "TRAEFIK_PERMANENT_KEYS_JSON": str,
         
         # New auth settings
         "AUTH_MODE": str,
         "CTFD_URL": str,
         "CTFD_API_KEY": str,
+        "DISCORD_WEBHOOK_URL": str,
     }
     try:
         from .database.connection import get_async_session
@@ -179,8 +507,8 @@ async def _auto_check_submissions():
         try:
             await asyncio.sleep(SUBMISSION_CHECK_INTERVAL)
             
-            flag_manager = get_flag_manager()
-            
+            flag_manager = await get_flag_manager()
+
             # Only run if there are flags to check
             if len(flag_manager.flag_lookup) == 0:
                 continue
@@ -204,8 +532,6 @@ async def _auto_check_submissions():
             traceback.print_exc()
             # Continue running despite errors
             await asyncio.sleep(10)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -230,9 +556,27 @@ async def lifespan(app: FastAPI):
     
     # Load settings overrides from database
     await _load_settings_from_db()
+
+    # Prune flag mappings for challenges that disable dynamic flags
+    disabled_ids = docker_manager.get_disabled_flag_challenge_ids()
+    if disabled_ids:
+        flag_mgr = await get_flag_manager()
+        removed = await flag_mgr.prune_mappings_for_disabled_challenges(disabled_ids)
+        if removed > 0:
+            print(f"[Startup] Pruned {removed} flag mapping(s) for challenges with disabled dynamic flags")
+
+    print("[Startup] Initializing Traefik Redis provider...")
+    await init_traefik_provider()
+
+    print("[Startup] Cleaning stale Whaley challenge containers...")
+    await docker_manager.cleanup_stale_instances_on_startup()
     
     await docker_manager.start_cleanup_task()
-    
+
+    # Register WebSocket lifecycle hook
+    _register_ws_lifecycle_hook()
+    print("[Startup] WebSocket lifecycle hook registered")
+
     # Initialize team mode
     team_mode_enabled = await init_team_mode()
     
@@ -250,6 +594,14 @@ async def lifespan(app: FastAPI):
     print(f"Loaded {len(docker_manager.challenges)} challenges")
     print(f"Database: {settings.DATABASE_URL or 'SQLite (default)'}")
     print(f"Redis: {settings.REDIS_URL or 'Not configured (using local locks)'}")
+    print(f"Traefik Redis provider: {'enabled' if settings.TRAEFIK_REDIS_ENABLED else 'disabled'}")
+    if settings.TRAEFIK_REDIS_ENABLED:
+        print(f"Traefik Redis URL: {settings.get_traefik_redis_url()}")
+        print(f"Instance domain suffix: {settings.TRAEFIK_BASE_DOMAIN}")
+    print(
+        "Discord webhook: "
+        f"{'enabled (URL hidden)' if (settings.DISCORD_WEBHOOK_URL or '').strip() else 'disabled'}"
+    )
     print(f"Network isolation: {'enabled' if settings.NETWORK_ISOLATION_ENABLED else 'disabled'}")
     print(f"Auto submission check: enabled (every {SUBMISSION_CHECK_INTERVAL}s)")
     
@@ -268,6 +620,9 @@ async def lifespan(app: FastAPI):
             pass
     
     await docker_manager.stop_cleanup_task()
+
+    print("[Shutdown] Closing Traefik Redis provider...")
+    await close_traefik_provider()
     
     # Close infrastructure connections
     print("[Shutdown] Closing lock manager...")
@@ -339,6 +694,105 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+# =============================================================================
+# WebSocket endpoints — real-time instance updates
+# =============================================================================
+
+async def _ws_lifecycle_hook(event: str, instance: "Instance", **extra: Any) -> None:
+    """Forward lifecycle events to WebSocket clients."""
+    from .models import Instance as InstanceModel
+
+    wsm = get_ws_manager()
+    instance_data = instance.model_dump()
+
+    owner_ids = []
+    if instance.user_id:
+        owner_ids.append(instance.user_id)
+    if instance.team_id:
+        owner_ids.append(instance.team_id)
+
+    if owner_ids:
+        await wsm.broadcast_to_owners(owner_ids, event, instance_data)
+    await wsm.broadcast_admin(event, instance_data)
+
+
+@app.websocket("/ws")
+async def ws_public(ws: WebSocket, token: str = Query(None)):
+    """Public WebSocket for real-time instance updates (authenticated via CTFd token)."""
+    if not token:
+        await ws.close(code=4001, reason="Missing token query parameter")
+        return
+
+    user = await ctfd_auth.validate_token(token)
+    if user is None:
+        await ws.close(code=4001, reason="Invalid CTFd token")
+        return
+
+    owner_id = user.team_id if is_team_mode() and user.team_id else user.user_id
+    wsm = get_ws_manager()
+    await wsm.connect_public(owner_id, ws)
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive_text(), timeout=60)
+                if data == "ping":
+                    await ws.send_text("pong")
+            except asyncio.TimeoutError:
+                await ws.send_text("pong")
+    except Exception:
+        pass
+    finally:
+        await wsm.disconnect(ws)
+
+
+@app.websocket("/ws/admin")
+async def ws_admin(ws: WebSocket, admin_key: str = Query(None)):
+    """Admin WebSocket for real-time instance and stats updates."""
+    if not settings.ADMIN_KEY:
+        await ws.close(code=4001, reason="Admin key not configured")
+        return
+    if not admin_key or admin_key != settings.ADMIN_KEY:
+        await ws.close(code=4001, reason="Invalid admin key")
+        return
+
+    wsm = get_ws_manager()
+    await wsm.connect_admin(ws)
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive_text(), timeout=60)
+                if data == "ping":
+                    await ws.send_text("pong")
+            except asyncio.TimeoutError:
+                await ws.send_text("pong")
+    except Exception:
+        pass
+    finally:
+        await wsm.disconnect(ws)
+
+
+def _register_ws_lifecycle_hook() -> None:
+    """Register the WebSocket lifecycle hook on the DockerManager."""
+    docker_manager.add_lifecycle_hook(_ws_lifecycle_hook)
+
+
+async def _broadcast_challenges_updated(public: bool = False) -> None:
+    """Notify WebSocket clients that the challenge list changed.
+
+    Admin connections always receive the event. Public (user) connections
+    only receive it when *public* is True — used for active/inactive toggles
+    where the user-visible challenge list actually changes.
+    """
+    wsm = get_ws_manager()
+    ts = time.time()
+    await wsm.broadcast_admin("challenges_updated", {"timestamp": ts})
+    if public:
+        for owner_id in list(wsm._public.keys()):
+            await wsm.broadcast_to_owner(owner_id, "challenges_updated", {"timestamp": ts})
+
+
 @app.get("/")
 async def root():
     """Serve the frontend UI."""
@@ -350,7 +804,6 @@ async def api_root():
     """API health check endpoint."""
     return {
         "status": "ok",
-        "service": "CTF Docker Instancer",
         "auth_mode": settings.AUTH_MODE
     }
 
@@ -360,11 +813,528 @@ async def health():
     """Detailed health check."""
     return {
         "status": "healthy",
-        "challenges_loaded": len(docker_manager.challenges),
         "active_instances": len(docker_manager.instances),
-        "ports_allocated": port_manager.get_allocated_count(),
-        "ports_available": port_manager.get_available_count()
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def prometheus_metrics(_: bool = Depends(verify_metrics_secret)):
+    """Expose Prometheus metrics focused on dynamic challenge instances."""
+    now_ts = time.time()
+    instances = list(docker_manager.instances.values())
+    challenge_name_lookup = {
+        str(challenge.id): str(challenge.name)
+        for challenge in docker_manager.challenges.values()
+    }
+
+    status_counts: Dict[str, int] = defaultdict(int)
+    open_instances: List[Instance] = []
+
+    for instance in instances:
+        raw_status = getattr(instance, "status", "unknown")
+        status = getattr(raw_status, "value", raw_status)
+        status_value = str(status).strip().lower()
+        if status_value.startswith("instancestatus."):
+            status_value = status_value.split(".", 1)[1]
+
+        status_counts[status_value] += 1
+        if status_value in ("running", "starting"):
+            open_instances.append(instance)
+
+    for known_status in ("running", "starting", "stopping", "stopped", "error"):
+        status_counts.setdefault(known_status, 0)
+
+    owner_counts: Dict[Tuple[str, str, str], int] = defaultdict(int)
+    team_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    challenge_counts: Dict[str, int] = defaultdict(int)
+    expiring_within_by_challenge: Dict[str, int] = defaultdict(int)
+    expiring_within_total = 0
+    starting_stale_total = 0
+    expiry_horizon_seconds = 300.0
+    stale_starting_seconds = 120.0
+
+    for instance in open_instances:
+        is_team_owned = bool(instance.team_id)
+        owner_type = "team" if is_team_owned else "user"
+        owner_id = (
+            instance.team_id
+            if is_team_owned
+            else (instance.owner_id or instance.user_id)
+        )
+        owner_name = (
+            instance.team_name
+            if is_team_owned
+            else (instance.username or owner_id)
+        )
+
+        owner_key = (str(owner_id or "unknown"), str(owner_name or "unknown"), owner_type)
+        owner_counts[owner_key] += 1
+        challenge_counts[str(instance.challenge_id)] += 1
+
+        if is_team_owned:
+            team_key = (str(instance.team_id or "unknown"), str(instance.team_name or "unknown"))
+            team_counts[team_key] += 1
+
+        raw_status = getattr(instance, "status", "unknown")
+        status = getattr(raw_status, "value", raw_status)
+        status_value = str(status).strip().lower()
+        if status_value.startswith("instancestatus."):
+            status_value = status_value.split(".", 1)[1]
+
+        expires_at = getattr(instance, "expires_at", None)
+        created_at = getattr(instance, "created_at", None)
+        seconds_until_expiry = max(0.0, (expires_at.timestamp() - now_ts)) if expires_at else 0.0
+        age_seconds = max(0.0, (now_ts - created_at.timestamp())) if created_at else 0.0
+
+        if seconds_until_expiry <= expiry_horizon_seconds:
+            expiring_within_total += 1
+            expiring_within_by_challenge[str(instance.challenge_id)] += 1
+
+        if status_value == "starting" and age_seconds > stale_starting_seconds:
+            starting_stale_total += 1
+
+    owner_limits = {
+        "user": max(1, int(settings.MAX_INSTANCES_PER_USER)),
+        "team": max(1, int(settings.MAX_INSTANCES_PER_TEAM)),
+    }
+
+    port_pool_total = max(0, settings.PORT_RANGE_END - settings.PORT_RANGE_START + 1)
+    port_pool_allocated = float(port_manager.get_allocated_count())
+    port_pool_available = float(max(port_pool_total - int(port_pool_allocated), 0))
+    port_pool_utilization = (port_pool_allocated / float(port_pool_total)) if port_pool_total > 0 else 0.0
+
+    active_rate_window_users = sum(
+        1
+        for timestamps in _user_rate_limit.values()
+        if any(ts > (now_ts - USER_RATE_WINDOW) for ts in timestamps)
+    )
+
+    flag_manager = await get_flag_manager()
+    flags_by_challenge: Dict[str, int] = defaultdict(int)
+    flags_by_owner: Dict[Tuple[str, str], int] = defaultdict(int)
+
+    for mapping in flag_manager.flag_mappings.values():
+        challenge_id = str(mapping.local_challenge_id or "unknown")
+        flags_by_challenge[challenge_id] += 1
+
+        if mapping.team_id:
+            flags_by_owner[(str(mapping.team_id), "team")] += 1
+        else:
+            flags_by_owner[(str(mapping.user_id), "user")] += 1
+
+    # Suspicious counts are fetched from DB (paginated storage, not in-memory).
+    # We emit a single total metric; per-challenge breakdown is omitted
+    # to avoid a full table scan on every Prometheus scrape.
+    suspicious_total = await flag_manager.count_suspicious_submissions()
+
+    forensics_stats = get_forensics_manager().get_stats()
+
+    event_counts: Dict[str, int] = {}
+    try:
+        logger_stats: Dict[str, Any] = await get_event_logger().get_stats()
+        raw_event_counts = logger_stats.get("event_counts", {}) if isinstance(logger_stats, dict) else {}
+        event_counts = {
+            str(event_type): int(count)
+            for event_type, count in raw_event_counts.items()
+        }
+    except Exception as exc:
+        print(f"[Metrics] Failed to load event logger stats: {exc}")
+
+    runtime_operations_snapshot = sorted(list(_runtime_operation_counters.items()))
+    spawn_latency_bucket_snapshot = {
+        bucket: _spawn_latency_bucket_counts.get(bucket, 0)
+        for bucket in SPAWN_LATENCY_BUCKETS_SECONDS
+    }
+    spawn_latency_count = _spawn_latency_count
+    spawn_latency_sum_seconds = _spawn_latency_sum_seconds
+    spawn_inflight_requests = _spawn_inflight_requests
+
+    lines: List[str] = [
+        "# HELP whaley_instances_open_total Number of open challenge instances (running or starting).",
+        "# TYPE whaley_instances_open_total gauge",
+        _format_prometheus_sample("whaley_instances_open_total", float(len(open_instances))),
+        "# HELP whaley_instances_status_total Number of challenge instances by status.",
+        "# TYPE whaley_instances_status_total gauge",
+    ]
+
+    for status, count in sorted(status_counts.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instances_status_total",
+                float(count),
+                {"status": status},
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_instances_by_owner Number of open instances by effective owner.",
+        "# TYPE whaley_instances_by_owner gauge",
+    ])
+    for (owner_id, owner_name, owner_type), count in sorted(owner_counts.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instances_by_owner",
+                float(count),
+                {
+                    "owner_id": owner_id,
+                    "owner_name": owner_name,
+                    "owner_type": owner_type,
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_owner_saturation_ratio Open instance saturation ratio per owner.",
+        "# TYPE whaley_owner_saturation_ratio gauge",
+    ])
+    for (owner_id, owner_name, owner_type), count in sorted(owner_counts.items()):
+        limit = owner_limits.get(owner_type, 1)
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_owner_saturation_ratio",
+                float(count) / float(limit),
+                {
+                    "owner_id": owner_id,
+                    "owner_name": owner_name,
+                    "owner_type": owner_type,
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_instances_by_team Number of open instances by team.",
+        "# TYPE whaley_instances_by_team gauge",
+    ])
+    for (team_id, team_name), count in sorted(team_counts.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instances_by_team",
+                float(count),
+                {
+                    "team_id": team_id,
+                    "team_name": team_name,
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_team_saturation_ratio Open instance saturation ratio per team.",
+        "# TYPE whaley_team_saturation_ratio gauge",
+    ])
+    for (team_id, team_name), count in sorted(team_counts.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_team_saturation_ratio",
+                float(count) / float(owner_limits["team"]),
+                {
+                    "team_id": team_id,
+                    "team_name": team_name,
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_instances_by_challenge Number of open instances by challenge id.",
+        "# TYPE whaley_instances_by_challenge gauge",
+    ])
+    for challenge_id, count in sorted(challenge_counts.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instances_by_challenge",
+                float(count),
+                {
+                    "challenge_id": challenge_id,
+                    "challenge_name": challenge_name_lookup.get(challenge_id, challenge_id),
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_instance_seconds_until_expiry Seconds remaining until each open instance expires.",
+        "# TYPE whaley_instance_seconds_until_expiry gauge",
+        "# HELP whaley_instance_age_seconds Age in seconds for each open instance.",
+        "# TYPE whaley_instance_age_seconds gauge",
+        "# HELP whaley_instance_info Metadata for each open instance (always 1).",
+        "# TYPE whaley_instance_info gauge",
+        "# HELP whaley_instance_connection_info Connection metadata for each open instance (always 1).",
+        "# TYPE whaley_instance_connection_info gauge",
+    ])
+
+    for instance in sorted(open_instances, key=lambda i: i.instance_id):
+        is_team_owned = bool(instance.team_id)
+        owner_type = "team" if is_team_owned else "user"
+        owner_id = (
+            instance.team_id
+            if is_team_owned
+            else (instance.owner_id or instance.user_id)
+        )
+        owner_name = (
+            instance.team_name
+            if is_team_owned
+            else (instance.username or owner_id)
+        )
+
+        raw_status = getattr(instance, "status", "unknown")
+        status = getattr(raw_status, "value", raw_status)
+        status_value = str(status).strip().lower()
+        if status_value.startswith("instancestatus."):
+            status_value = status_value.split(".", 1)[1]
+
+        expires_at = getattr(instance, "expires_at", None)
+        created_at = getattr(instance, "created_at", None)
+        seconds_until_expiry = max(0.0, (expires_at.timestamp() - now_ts)) if expires_at else 0.0
+        age_seconds = max(0.0, (now_ts - created_at.timestamp())) if created_at else 0.0
+
+        connection_labels = _infer_instance_connection_labels(instance)
+        challenge_config = docker_manager.challenges.get(str(instance.challenge_id))
+        challenge_tls = getattr(challenge_config, "tls_enabled", None)
+        tls_enabled_label = "unknown" if challenge_tls is None else ("true" if challenge_tls else "false")
+
+        shared_labels = {
+            "instance_id": str(instance.instance_id),
+            "challenge_id": str(instance.challenge_id),
+            "challenge_name": challenge_name_lookup.get(str(instance.challenge_id), str(instance.challenge_id)),
+            "owner_id": str(owner_id or "unknown"),
+            "owner_name": str(owner_name or "unknown"),
+            "owner_type": owner_type,
+            "username": str(instance.username or "unknown"),
+            "spawner_username": str(instance.username or "unknown"),
+            "spawner_user_id": str(instance.user_id or "unknown"),
+            "team_id": str(instance.team_id or "none"),
+            "team_name": str(instance.team_name or "none"),
+            "tls_enabled": tls_enabled_label,
+            "status": status_value,
+            **connection_labels,
+        }
+
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instance_seconds_until_expiry",
+                seconds_until_expiry,
+                shared_labels,
+            )
+        )
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instance_age_seconds",
+                age_seconds,
+                shared_labels,
+            )
+        )
+        lines.append(_format_prometheus_sample("whaley_instance_info", 1.0, shared_labels))
+        lines.append(_format_prometheus_sample("whaley_instance_connection_info", 1.0, shared_labels))
+
+    lines.extend([
+        "# HELP whaley_instances_expiring_within_total Number of open instances expiring within the configured horizon.",
+        "# TYPE whaley_instances_expiring_within_total gauge",
+        _format_prometheus_sample(
+            "whaley_instances_expiring_within_total",
+            float(expiring_within_total),
+            {"horizon_seconds": str(int(expiry_horizon_seconds))},
+        ),
+        "# HELP whaley_instances_expiring_within_by_challenge Number of open instances expiring soon by challenge.",
+        "# TYPE whaley_instances_expiring_within_by_challenge gauge",
+    ])
+    for challenge_id, count in sorted(expiring_within_by_challenge.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_instances_expiring_within_by_challenge",
+                float(count),
+                {
+                    "horizon_seconds": str(int(expiry_horizon_seconds)),
+                    "challenge_id": challenge_id,
+                    "challenge_name": challenge_name_lookup.get(challenge_id, challenge_id),
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_instances_starting_stale_total Number of starting instances older than the stale threshold.",
+        "# TYPE whaley_instances_starting_stale_total gauge",
+        _format_prometheus_sample("whaley_instances_starting_stale_total", float(starting_stale_total)),
+        "# HELP whaley_challenges_loaded_total Number of challenge definitions loaded by Whaley.",
+        "# TYPE whaley_challenges_loaded_total gauge",
+        _format_prometheus_sample("whaley_challenges_loaded_total", float(len(docker_manager.challenges))),
+        "# HELP whaley_challenges_active_total Number of active challenges available for spawn.",
+        "# TYPE whaley_challenges_active_total gauge",
+        _format_prometheus_sample("whaley_challenges_active_total", float(len(docker_manager.get_active_challenges()))),
+        "# HELP whaley_owner_instance_limit Configured instance limit by owner type.",
+        "# TYPE whaley_owner_instance_limit gauge",
+        _format_prometheus_sample(
+            "whaley_owner_instance_limit",
+            float(settings.MAX_INSTANCES_PER_USER),
+            {"owner_type": "user"},
+        ),
+        _format_prometheus_sample(
+            "whaley_owner_instance_limit",
+            float(settings.MAX_INSTANCES_PER_TEAM),
+            {"owner_type": "team"},
+        ),
+    ])
+
+    lines.extend([
+        "# HELP whaley_port_pool_total Total ports available in configured pool.",
+        "# TYPE whaley_port_pool_total gauge",
+        _format_prometheus_sample("whaley_port_pool_total", float(port_pool_total)),
+        "# HELP whaley_port_pool_allocated Currently allocated ports in active pool.",
+        "# TYPE whaley_port_pool_allocated gauge",
+        _format_prometheus_sample("whaley_port_pool_allocated", port_pool_allocated),
+        "# HELP whaley_port_pool_available Currently available ports in active pool.",
+        "# TYPE whaley_port_pool_available gauge",
+        _format_prometheus_sample("whaley_port_pool_available", port_pool_available),
+        "# HELP whaley_port_pool_utilization_ratio Current port pool utilization ratio (0-1).",
+        "# TYPE whaley_port_pool_utilization_ratio gauge",
+        _format_prometheus_sample("whaley_port_pool_utilization_ratio", port_pool_utilization),
+        "# HELP whaley_active_rate_window_users Number of users with instance lifecycle requests in the active rate-limit window.",
+        "# TYPE whaley_active_rate_window_users gauge",
+        _format_prometheus_sample("whaley_active_rate_window_users", float(active_rate_window_users)),
+    ])
+
+    lines.extend([
+        "# HELP whaley_flags_assigned_total Number of dynamic flags currently tracked.",
+        "# TYPE whaley_flags_assigned_total gauge",
+        _format_prometheus_sample("whaley_flags_assigned_total", float(len(flag_manager.flag_mappings))),
+        "# HELP whaley_flags_assigned_by_challenge Number of dynamic flags by challenge.",
+        "# TYPE whaley_flags_assigned_by_challenge gauge",
+    ])
+    for challenge_id, count in sorted(flags_by_challenge.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_flags_assigned_by_challenge",
+                float(count),
+                {
+                    "challenge_id": challenge_id,
+                    "challenge_name": challenge_name_lookup.get(challenge_id, challenge_id),
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_flags_assigned_by_owner Number of dynamic flags by owner.",
+        "# TYPE whaley_flags_assigned_by_owner gauge",
+    ])
+    for (owner_id, owner_type), count in sorted(flags_by_owner.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_flags_assigned_by_owner",
+                float(count),
+                {
+                    "owner_id": owner_id,
+                    "owner_type": owner_type,
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_suspicious_submissions_total Number of suspicious submissions currently tracked.",
+        "# TYPE whaley_suspicious_submissions_total gauge",
+        _format_prometheus_sample("whaley_suspicious_submissions_total", float(suspicious_total)),
+    ])
+
+    lines.extend([
+        "# HELP whaley_forensics_auto_capture_enabled Whether automatic forensics capture is enabled (1/0).",
+        "# TYPE whaley_forensics_auto_capture_enabled gauge",
+        _format_prometheus_sample(
+            "whaley_forensics_auto_capture_enabled",
+            1.0 if forensics_stats.get("auto_capture_enabled") else 0.0,
+        ),
+        "# HELP whaley_forensics_logs_total Total stored forensics logs by capture type.",
+        "# TYPE whaley_forensics_logs_total gauge",
+        _format_prometheus_sample(
+            "whaley_forensics_logs_total",
+            float(forensics_stats.get("auto_capture_count", 0)),
+            {"capture_type": "auto"},
+        ),
+        _format_prometheus_sample(
+            "whaley_forensics_logs_total",
+            float(forensics_stats.get("live_capture_count", 0)),
+            {"capture_type": "live"},
+        ),
+        "# HELP whaley_forensics_storage_bytes Total bytes consumed by forensics logs.",
+        "# TYPE whaley_forensics_storage_bytes gauge",
+        _format_prometheus_sample("whaley_forensics_storage_bytes", float(forensics_stats.get("total_size_bytes", 0))),
+    ])
+
+    lines.extend([
+        "# HELP whaley_runtime_operations_total Runtime operation outcomes tracked since process start.",
+        "# TYPE whaley_runtime_operations_total counter",
+    ])
+    for (operation, outcome, reason, challenge_id), count in runtime_operations_snapshot:
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_runtime_operations_total",
+                float(count),
+                {
+                    "operation": operation,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "challenge_id": challenge_id,
+                    "challenge_name": challenge_name_lookup.get(challenge_id, challenge_id),
+                },
+            )
+        )
+
+    lines.extend([
+        "# HELP whaley_spawn_inflight Number of spawn requests currently in-flight.",
+        "# TYPE whaley_spawn_inflight gauge",
+        _format_prometheus_sample("whaley_spawn_inflight", float(spawn_inflight_requests)),
+        "# HELP whaley_spawn_latency_seconds Histogram of spawn request latency observed by API.",
+        "# TYPE whaley_spawn_latency_seconds histogram",
+    ])
+
+    for bucket in SPAWN_LATENCY_BUCKETS_SECONDS:
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_spawn_latency_seconds_bucket",
+                float(spawn_latency_bucket_snapshot.get(bucket, 0)),
+                {"le": f"{bucket:g}"},
+            )
+        )
+
+    lines.extend([
+        _format_prometheus_sample(
+            "whaley_spawn_latency_seconds_bucket",
+            float(spawn_latency_count),
+            {"le": "+Inf"},
+        ),
+        _format_prometheus_sample("whaley_spawn_latency_seconds_sum", float(spawn_latency_sum_seconds)),
+        _format_prometheus_sample("whaley_spawn_latency_seconds_count", float(spawn_latency_count)),
+        "# HELP whaley_event_log_total Cumulative count of persisted Whaley event logs by event type.",
+        "# TYPE whaley_event_log_total counter",
+    ])
+
+    for event_type, count in sorted(event_counts.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_event_log_total",
+                float(count),
+                {"event_type": event_type},
+            )
+        )
+
+    lifecycle_event_map = {
+        "spawn_success": "instance_spawn",
+        "spawn_failed": "instance_spawn_failed",
+        "stop": "instance_stop",
+        "extend": "instance_extend",
+        "expired": "instance_expired",
+    }
+
+    lines.extend([
+        "# HELP whaley_lifecycle_events_total Cumulative lifecycle operations from persisted event logs.",
+        "# TYPE whaley_lifecycle_events_total counter",
+    ])
+    for lifecycle_event, event_type in sorted(lifecycle_event_map.items()):
+        lines.append(
+            _format_prometheus_sample(
+                "whaley_lifecycle_events_total",
+                float(event_counts.get(event_type, 0)),
+                {"event": lifecycle_event},
+            )
+        )
+
+    payload = "\n".join(lines) + "\n"
+    return PlainTextResponse(payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/config")
@@ -375,15 +1345,19 @@ async def get_config():
         "max_instances_per_user": settings.MAX_INSTANCES_PER_USER,
         "max_instances_per_team": settings.MAX_INSTANCES_PER_TEAM,
         "instance_timeout": settings.INSTANCE_TIMEOUT,
-        "auth_mode": settings.AUTH_MODE.value if hasattr(settings.AUTH_MODE, 'value') else str(settings.AUTH_MODE)
+        "auth_mode": settings.AUTH_MODE.value if hasattr(settings.AUTH_MODE, 'value') else str(settings.AUTH_MODE),
+        "ctfd_url": settings.CTFD_URL or None,
     }
 
 
-@app.get("/challenges", response_model=ChallengeListResponse)
+@app.get("/challenges", response_model=PublicChallengeListResponse)
 async def list_challenges(user: UserInfo = Depends(get_current_user)):
     """List active challenges that can be spawned."""
-    challenges = docker_manager.get_active_challenges()
-    return ChallengeListResponse(challenges=challenges)
+    challenges = [
+        _to_public_challenge(challenge)
+        for challenge in docker_manager.get_active_challenges()
+    ]
+    return PublicChallengeListResponse(challenges=challenges)
 
 
 @app.get("/challenges/{challenge_id}")
@@ -396,74 +1370,139 @@ async def get_challenge(
     if not challenge:
         raise HTTPException(status_code=404, detail="Challenge not found")
     
-    return challenge.to_info()
+    return _to_public_challenge(challenge.to_info())
 
 
-@app.post("/instances/spawn", response_model=SpawnResponse)
+@app.post("/instances/spawn", response_model=PublicSpawnResponse)
 async def spawn_instance(
     request: SpawnRequest,
     req: Request,
     user: UserInfo = Depends(get_current_user)
 ):
     """Spawn a new challenge instance."""
-    # Rate limit check
-    if not check_user_rate_limit(user.user_id):
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many requests. Please wait before trying again (limit: {USER_RATE_LIMIT} requests per minute)"
-        )
-    
-    client_ip = get_client_ip(req)
-    team_mode = is_team_mode()
-    
-    # Block spawning inactive challenges
-    if not docker_manager.is_challenge_active(request.challenge_id):
-        raise HTTPException(status_code=403, detail="This challenge is currently inactive")
-    
-    success, message, instance = await docker_manager.spawn_instance(
-        challenge_id=request.challenge_id,
-        user_id=user.user_id,
-        username=user.username,
-        user_info=user,
-        team_mode=team_mode
-    )
-    
-    # Log the event
-    logger = get_event_logger()
-    if success and instance:
-        await logger.log_instance_spawn(
+    spawn_started_at = time.monotonic()
+    _spawn_started()
+    operation_recorded = False
+
+    try:
+        # Rate limit check
+        if not check_user_rate_limit(user.user_id):
+            _record_runtime_operation("spawn", "failed", request.challenge_id, "rate_limited")
+            operation_recorded = True
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many requests. Please wait before trying again (limit: {USER_RATE_LIMIT} requests per minute)"
+            )
+
+        client_ip = get_client_ip(req)
+        team_mode = is_team_mode()
+
+        # Block spawning inactive challenges
+        if not docker_manager.is_challenge_active(request.challenge_id):
+            _record_runtime_operation("spawn", "failed", request.challenge_id, "challenge_inactive")
+            operation_recorded = True
+            raise HTTPException(status_code=403, detail="This challenge is currently inactive")
+
+        challenge = docker_manager.get_challenge(request.challenge_id)
+
+        success, raw_message, instance = await docker_manager.spawn_instance(
+            challenge_id=request.challenge_id,
             user_id=user.user_id,
             username=user.username,
-            instance_id=instance.instance_id,
-            challenge_id=request.challenge_id,
-            ports=instance.ports,
-            public_url=instance.public_url or "",
-            ip_address=client_ip,
-            extra={"team_id": user.team_id, "team_name": user.team_name, "team_mode": team_mode} if team_mode else None
+            user_info=user,
+            team_mode=team_mode
         )
-    else:
-        # Extract docker error if present in message
-        docker_error = None
-        if "docker-compose failed:" in message:
-            docker_error = message.split("docker-compose failed:", 1)[-1].strip()
-        
-        await logger.log_instance_spawn_failed(
-            user_id=user.user_id,
-            username=user.username,
-            challenge_id=request.challenge_id,
-            reason=message,
-            ip_address=client_ip,
-            docker_error=docker_error,
+
+        # Log the event
+        logger = get_event_logger()
+        notifier = get_discord_notifier()
+        if success and instance:
+            _record_runtime_operation("spawn", "success", request.challenge_id, "none")
+            operation_recorded = True
+
+            await logger.log_instance_spawn(
+                user_id=user.user_id,
+                username=user.username,
+                instance_id=instance.instance_id,
+                challenge_id=request.challenge_id,
+                ports=instance.ports,
+                public_url=instance.public_url or "",
+                ip_address=client_ip,
+                extra={"team_id": user.team_id, "team_name": user.team_name, "team_mode": team_mode} if team_mode else None
+            )
+
+            await notifier.notify_instance_spawn(
+                instance_id=instance.instance_id,
+                challenge_id=request.challenge_id,
+                challenge_name=challenge.name if challenge else None,
+                created_by=user.username,
+                created_by_id=user.user_id,
+                created_at=instance.created_at,
+                expires_at=instance.expires_at,
+                team_id=user.team_id if team_mode else None,
+                team_name=user.team_name if team_mode else None,
+                public_url=instance.public_url,
+                connection_hint=instance.connection_hint,
+                routing_type=instance.routing_type,
+                ports=instance.ports,
+                ip_address=client_ip,
+            )
+        else:
+            failure_reason = _classify_spawn_failure_reason(raw_message)
+            _record_runtime_operation("spawn", "failed", request.challenge_id, failure_reason)
+            operation_recorded = True
+
+            # Extract docker error if present in message
+            docker_error = None
+            if "docker-compose failed:" in raw_message:
+                docker_error = raw_message.split("docker-compose failed:", 1)[-1].strip()
+
+            await logger.log_instance_spawn_failed(
+                user_id=user.user_id,
+                username=user.username,
+                challenge_id=request.challenge_id,
+                reason=raw_message,
+                ip_address=client_ip,
+                docker_error=docker_error,
+            )
+
+            await notifier.notify_instance_spawn_failed(
+                challenge_id=request.challenge_id,
+                challenge_name=challenge.name if challenge else None,
+                username=user.username,
+                user_id=user.user_id,
+                reason=raw_message,
+                team_id=user.team_id if team_mode else None,
+                team_name=user.team_name if team_mode else None,
+                ip_address=client_ip,
+            )
+
+        public_message = raw_message if success else _sanitize_user_error_message(
+            raw_message,
+            "Failed to deploy instance",
         )
-    
-    return SpawnResponse(
-        success=success,
-        message=message,
-        instance=instance
-    )
+
+        return PublicSpawnResponse(
+            success=success,
+            message=public_message,
+            instance=_to_public_instance(instance) if instance else None
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if not operation_recorded:
+            _record_runtime_operation(
+                "spawn",
+                "failed",
+                request.challenge_id,
+                _classify_spawn_failure_reason(str(exc)),
+            )
+        raise
+    finally:
+        _spawn_finished(time.monotonic() - spawn_started_at)
 
 
-@app.get("/instances", response_model=InstanceListResponse)
+@app.get("/instances", response_model=PublicInstanceListResponse)
 async def list_instances(user: UserInfo = Depends(get_current_user)):
     """List all instances for the current user/team."""
     team_mode = is_team_mode()
@@ -475,7 +1514,9 @@ async def list_instances(user: UserInfo = Depends(get_current_user)):
         # In user mode, show only user's instances
         instances = docker_manager.get_user_instances(user.user_id)
     
-    return InstanceListResponse(instances=instances)
+    return PublicInstanceListResponse(
+        instances=[_to_public_instance(instance) for instance in instances]
+    )
 
 
 @app.get("/instances/{instance_id}")
@@ -498,7 +1539,7 @@ async def get_instance(
         if instance.user_id != user.user_id:
             raise HTTPException(status_code=403, detail="Access denied")
     
-    return instance
+    return _to_public_instance(instance)
 
 
 @app.delete("/instances/{instance_id}")
@@ -510,6 +1551,7 @@ async def stop_instance(
     """Stop and remove an instance."""
     # Rate limit check
     if not check_user_rate_limit(user.user_id):
+        _record_runtime_operation("stop", "failed", "unknown", "rate_limited")
         raise HTTPException(
             status_code=429,
             detail=f"Too many requests. Please wait before trying again (limit: {USER_RATE_LIMIT} requests per minute)"
@@ -521,6 +1563,7 @@ async def stop_instance(
     # Get instance info before stopping for logging
     instance = docker_manager.instances.get(instance_id)
     challenge_id = instance.challenge_id if instance else "unknown"
+    challenge = docker_manager.get_challenge(challenge_id) if instance else None
     
     success, message = await docker_manager.stop_instance(
         instance_id=instance_id,
@@ -530,6 +1573,7 @@ async def stop_instance(
     )
     
     if success:
+        _record_runtime_operation("stop", "success", challenge_id, "user_stop")
         logger = get_event_logger()
         await logger.log_instance_stop(
             user_id=user.user_id,
@@ -538,9 +1582,29 @@ async def stop_instance(
             challenge_id=challenge_id,
             ip_address=client_ip,
         )
+
+        notifier = get_discord_notifier()
+        await notifier.notify_instance_stopped(
+            instance_id=instance_id,
+            challenge_id=challenge_id,
+            challenge_name=challenge.name if challenge else None,
+            stopped_by=user.username,
+            stopped_by_id=user.user_id,
+            reason="user_stop",
+            owner_username=instance.username if instance else user.username,
+            owner_user_id=instance.user_id if instance else user.user_id,
+            team_id=instance.team_id if instance else user.team_id,
+            team_name=instance.team_name if instance else user.team_name,
+            ip_address=client_ip,
+            message=message,
+        )
     
     if not success:
-        raise HTTPException(status_code=400, detail=message)
+        _record_runtime_operation("stop", "failed", challenge_id, _classify_operation_failure_reason(message))
+        raise HTTPException(
+            status_code=400,
+            detail=_sanitize_user_error_message(message, "Failed to stop instance")
+        )
     
     return {"success": True, "message": message}
 
@@ -554,6 +1618,7 @@ async def extend_instance(
     """Extend the lifetime of an instance."""
     # Rate limit check
     if not check_user_rate_limit(user.user_id):
+        _record_runtime_operation("extend", "failed", "unknown", "rate_limited")
         raise HTTPException(
             status_code=429,
             detail=f"Too many requests. Please wait before trying again (limit: {USER_RATE_LIMIT} requests per minute)"
@@ -561,8 +1626,9 @@ async def extend_instance(
     
     client_ip = get_client_ip(req)
     team_mode = is_team_mode()
+    instance_before = docker_manager.instances.get(instance_id)
     
-    success, message = await docker_manager.extend_instance(
+    success, message, applied_extension_seconds = await docker_manager.extend_instance(
         instance_id=instance_id,
         user_id=user.user_id,
         team_id=user.team_id,
@@ -570,22 +1636,51 @@ async def extend_instance(
     )
     
     if success:
+        current_instance = docker_manager.instances.get(instance_id) or instance_before
+        challenge_id = current_instance.challenge_id if current_instance else "unknown"
+        _record_runtime_operation("extend", "success", challenge_id, "none")
+
         logger = get_event_logger()
         await logger.log_instance_extend(
             user_id=user.user_id,
             username=user.username,
             instance_id=instance_id,
-            extension_seconds=1800,
+            extension_seconds=applied_extension_seconds,
+            ip_address=client_ip,
+        )
+
+        challenge = docker_manager.get_challenge(challenge_id) if challenge_id != "unknown" else None
+
+        notifier = get_discord_notifier()
+        await notifier.notify_instance_extended(
+            instance_id=instance_id,
+            challenge_id=challenge_id,
+            challenge_name=challenge.name if challenge else None,
+            extended_by=user.username,
+            extended_by_id=user.user_id,
+            extension_seconds=applied_extension_seconds,
+            expires_at=current_instance.expires_at if current_instance else None,
+            team_id=current_instance.team_id if current_instance else user.team_id,
+            team_name=current_instance.team_name if current_instance else user.team_name,
             ip_address=client_ip,
         )
     
     if not success:
-        raise HTTPException(status_code=400, detail=message)
+        challenge_id = instance_before.challenge_id if instance_before else "unknown"
+        _record_runtime_operation("extend", "failed", challenge_id, _classify_operation_failure_reason(message))
+        raise HTTPException(
+            status_code=400,
+            detail=_sanitize_user_error_message(message, "Failed to extend instance")
+        )
     
-    return {"success": True, "message": message}
+    return {
+        "success": True,
+        "message": message,
+        "extended_seconds": applied_extension_seconds,
+    }
 
 
-@app.get("/me")
+@app.get("/me", response_model=PublicMeResponse)
 async def get_me(user: UserInfo = Depends(get_current_user)):
     """Get current user information."""
     team_mode = is_team_mode()
@@ -598,7 +1693,7 @@ async def get_me(user: UserInfo = Depends(get_current_user)):
         max_instances = settings.MAX_INSTANCES_PER_USER
     
     return {
-        "user": user,
+        "user": PublicUserInfo(username=user.username),
         "instances": instance_count,
         "max_instances": max_instances,
         "team_mode": team_mode
@@ -624,17 +1719,69 @@ async def get_my_team(
             "message": "You are not in a team"
         }
     
-    # Get team members from CTFd
+    team_name = user.team_name
     members = []
     if ctfd_auth and credentials:
-        members = await ctfd_auth.get_team_members(int(user.team_id), credentials.credentials)
+        if not team_name:
+            team_info = await ctfd_auth.get_team_info(int(user.team_id), credentials.credentials)
+            if team_info:
+                team_name = team_info.get("name")
+
+        raw_members = await ctfd_auth.get_team_members(int(user.team_id), credentials.credentials)
+
+        current_user_id = str(user.user_id)
+        current_username = (user.username or "").strip().lower()
+
+        for member in raw_members:
+            if not isinstance(member, dict):
+                continue
+
+            member_id = str(member.get("id", "")).strip()
+            member_name = str(member.get("name", "")).strip()
+            if not member_name:
+                continue
+
+            is_current = (
+                bool(member_id and member_id == current_user_id)
+                or bool(current_username and member_name.lower() == current_username)
+            )
+
+            members.append({
+                "name": member_name,
+                "is_current": is_current,
+            })
+
+    current_user_id = str(user.user_id)
+    current_username = (user.username or "").strip()
+
+    if members:
+        has_current = any(bool(member.get("is_current")) for member in members if isinstance(member, dict))
+        if not has_current and current_username:
+            current_username_lower = current_username.lower()
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                member_name = str(member.get("name", "")).strip().lower()
+                if member_name and member_name == current_username_lower:
+                    member["is_current"] = True
+                    has_current = True
+                    break
+
+        if not has_current and current_username:
+            members.append({
+                "name": current_username,
+                "is_current": True,
+            })
+    elif current_username:
+        members.append({
+            "name": current_username,
+            "is_current": True,
+        })
     
     return {
         "team_mode": True,
-        "team_id": user.team_id,
-        "team_name": user.team_name,
+        "team_name": team_name,
         "members": members,
-        "current_user_id": user.user_id
     }
 
 
@@ -682,9 +1829,15 @@ def verify_admin_key(
     return True
 
 
-@app.get("/admin")
+@app.get(f"/{settings.ADMIN_PATH}")
 async def admin_dashboard():
-    """Serve the admin dashboard UI."""
+    """Serve the admin dashboard UI at the configurable ADMIN_PATH route.
+
+    The path defaults to ``/admin`` but can be set to e.g. ``/admin-<hex>``
+    via the ADMIN_PATH env var to keep the dashboard URL off the wordlists
+    indexed by attackers. This is URL-obscurity only; ADMIN_KEY remains the
+    real auth gate on /admin/api/*.
+    """
     return FileResponse(str(STATIC_DIR / "admin.html"))
 
 
@@ -754,20 +1907,158 @@ async def admin_stop_instance(
     _: bool = Depends(verify_admin_key)
 ):
     """Force stop an instance (admin)."""
+    instance = docker_manager.instances.get(instance_id)
+    challenge_id = instance.challenge_id if instance else "unknown"
+    challenge = docker_manager.get_challenge(challenge_id) if instance else None
+
     success, message = await docker_manager.stop_instance(
         instance_id=instance_id,
-        user_id=None  # Admin can stop any instance
+        user_id=None,  # Admin can stop any instance
+        terminate_reason="admin_stop",
     )
     
     if success:
+        _record_runtime_operation("stop", "success", challenge_id, "admin_stop")
         logger = get_event_logger()
         await logger.log(
             EventType.INSTANCE_STOP,
             f"Admin force-stopped instance '{instance_id}'",
             instance_id=instance_id,
+            challenge_id=challenge_id if challenge_id != "unknown" else None,
+            details={"reason": "admin_stop"},
         )
+
+        notifier = get_discord_notifier()
+        await notifier.notify_instance_stopped(
+            instance_id=instance_id,
+            challenge_id=challenge_id,
+            challenge_name=challenge.name if challenge else None,
+            stopped_by="admin",
+            reason="admin_stop",
+            owner_username=instance.username if instance else None,
+            owner_user_id=instance.user_id if instance else None,
+            team_id=instance.team_id if instance else None,
+            team_name=instance.team_name if instance else None,
+            message=message,
+        )
+    else:
+        _record_runtime_operation("stop", "failed", challenge_id, _classify_operation_failure_reason(message))
     
     return {"success": success, "message": message}
+
+
+@app.post("/admin/api/instances/spawn")
+async def admin_spawn_instance(
+    request: Request,
+    _: bool = Depends(verify_admin_key)
+):
+    """Admin test-spawn: create an instance for a target user, bypassing the
+    active/inactive gate. Used to smoke-test challenges before publishing.
+
+    Body: { challenge_id: str, user_id: int }
+    """
+    body = await request.json()
+    challenge_id = str(body.get("challenge_id", "")).strip()
+    raw_user_id = body.get("user_id")
+
+    if not challenge_id:
+        raise HTTPException(status_code=400, detail="challenge_id is required")
+    if raw_user_id is None:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    try:
+        target_user_id = int(raw_user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="user_id must be an integer")
+
+    if target_user_id < 1:
+        raise HTTPException(status_code=400, detail="user_id must be positive")
+
+    # Resolve the target user via CTFd admin API
+    target_user = await ctfd_auth.resolve_user_by_id(target_user_id)
+    if target_user is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"CTFd user #{target_user_id} not found.",
+        )
+
+    target_username = target_user.username
+
+    team_mode = is_team_mode()
+    if team_mode:
+        if not target_user.team_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Team mode is enabled but user '{target_username}' has no CTFd team. "
+                       "Assign the user to a team in CTFd first.",
+            )
+        owner_id = target_user.team_id
+        max_instances = settings.MAX_INSTANCES_PER_TEAM
+    else:
+        owner_id = target_user.user_id
+        max_instances = settings.MAX_INSTANCES_PER_USER
+
+    # Check owner instance limit (same as normal spawn)
+    if docker_manager.get_owner_instance_count(owner_id, team_mode) >= max_instances:
+        detail = (
+            f"Team has reached the maximum instance limit ({max_instances})"
+            if team_mode
+            else f"User has reached the maximum instance limit ({max_instances})"
+        )
+        raise HTTPException(status_code=429, detail=detail)
+
+    # Skip the is_active check — the whole point of this endpoint
+    client_ip = get_client_ip(request)
+
+    success, message_str, instance = await docker_manager.spawn_instance(
+        challenge_id=challenge_id,
+        user_id=target_user.user_id,
+        username=target_user.username,
+        user_info=target_user,
+        team_mode=team_mode,
+    )
+
+    if not success or instance is None:
+        raise HTTPException(status_code=500, detail=message_str)
+
+    challenge = docker_manager.get_challenge(challenge_id)
+
+    logger = get_event_logger()
+    await logger.log_instance_spawn(
+        user_id=target_user.user_id,
+        username=target_username,
+        instance_id=instance.instance_id,
+        challenge_id=challenge_id,
+        ports=instance.ports,
+        public_url=instance.public_url or "",
+        ip_address=client_ip,
+        extra={"admin_test_spawn": True, "team_id": target_user.team_id, "team_name": target_user.team_name},
+    )
+
+    notifier = get_discord_notifier()
+    await notifier.notify_instance_spawn(
+        instance_id=instance.instance_id,
+        challenge_id=challenge_id,
+        challenge_name=challenge.name if challenge else None,
+        created_by=target_username,
+        created_by_id=target_user.user_id,
+        created_at=instance.created_at,
+        expires_at=instance.expires_at,
+        team_id=target_user.team_id if team_mode else None,
+        team_name=target_user.team_name if team_mode else None,
+        public_url=instance.public_url,
+        connection_hint=instance.connection_hint,
+        routing_type=instance.routing_type,
+        ports=instance.ports,
+        ip_address=client_ip,
+        is_admin_test_spawn=True,
+    )
+
+    return {
+        "success": True,
+        "message": f"Instance started successfully for {target_username}",
+        "instance": instance.model_dump(),
+    }
 
 
 @app.get("/admin/api/user-ports")
@@ -878,29 +2169,36 @@ async def admin_delete_user_ports(
 @app.get("/admin/api/flags")
 async def admin_get_flags(_: bool = Depends(verify_admin_key)):
     """Get all flag mappings and suspicious submissions."""
-    flag_mgr = get_flag_manager()
-    data = flag_mgr.get_all_mappings()
-    
+    flag_mgr = await get_flag_manager()
+    data = await flag_mgr.get_all_mappings()
+
     # Add config info
     data["dynamic_flags_enabled"] = settings.DYNAMIC_FLAGS_ENABLED
     data["ctfd_configured"] = bool(settings.CTFD_URL and settings.CTFD_API_KEY)
-    
+
     return data
 
 
 @app.post("/admin/api/flags/check-submissions")
 async def admin_check_submissions(
     limit: int = 100,
+    full_scan: bool = False,
     _: bool = Depends(verify_admin_key)
 ):
-    """Check recent submissions for cheating (flag sharing)."""
-    flag_mgr = get_flag_manager()
-    
+    """Check recent submissions for cheating (flag sharing).
+
+    Set full_scan=true to re-check all recent submissions regardless of
+    the incremental checkpoint. Default (false) only checks new submissions
+    since the last check.
+    """
+    flag_mgr = await get_flag_manager()
+
     if not settings.CTFD_URL or not settings.CTFD_API_KEY:
         raise HTTPException(status_code=400, detail="CTFd not configured")
-    
-    new_suspicious = await flag_mgr.check_submissions(limit=limit)
-    
+
+    new_suspicious = await flag_mgr.check_submissions(limit=limit, full_scan=full_scan)
+    total = await flag_mgr.count_suspicious_submissions()
+
     return {
         "success": True,
         "new_suspicious_count": len(new_suspicious),
@@ -911,27 +2209,33 @@ async def admin_check_submissions(
                 "flag_owner": s.flag_owner_username,
                 "challenge": s.local_challenge_id,
                 "time": s.submission_time,
-                "ip": s.ip_address
+                "ip": s.ip_address,
             }
             for s in new_suspicious
         ],
-        "total_suspicious": len(flag_mgr.suspicious_submissions)
+        "total_suspicious": total,
     }
 
 
 @app.delete("/admin/api/flags/suspicious")
 async def admin_clear_suspicious(_: bool = Depends(verify_admin_key)):
     """Clear the suspicious submissions list."""
-    flag_mgr = get_flag_manager()
+    flag_mgr = await get_flag_manager()
     count = flag_mgr.clear_suspicious_submissions()
     return {"success": True, "cleared": count}
 
 
 @app.get("/admin/api/flags/suspicious")
-async def admin_get_suspicious(_: bool = Depends(verify_admin_key)):
-    """Get all suspicious submissions (flag sharing detections)."""
-    flag_mgr = get_flag_manager()
-    
+async def admin_get_suspicious(
+    offset: int = 0,
+    limit: int = 50,
+    _: bool = Depends(verify_admin_key),
+):
+    """Get paginated suspicious submissions (flag sharing detections)."""
+    flag_mgr = await get_flag_manager()
+    submissions = await flag_mgr.get_suspicious_submissions(offset=offset, limit=limit)
+    total = await flag_mgr.count_suspicious_submissions()
+
     return {
         "suspicious": [
             {
@@ -942,19 +2246,24 @@ async def admin_get_suspicious(_: bool = Depends(verify_admin_key)):
                 "flag_owner_username": s.flag_owner_username,
                 "challenge_id": s.challenge_id,
                 "local_challenge_id": s.local_challenge_id,
+                "provided_flag": s.provided_flag,
                 "submission_time": s.submission_time,
-                "ip_address": s.ip_address
+                "ip_address": s.ip_address,
+                "submitter_team_id": s.submitter_team_id,
+                "submitter_team_name": s.submitter_team_name,
+                "flag_owner_team_id": s.flag_owner_team_id,
+                "flag_owner_team_name": s.flag_owner_team_name,
             }
-            for s in flag_mgr.suspicious_submissions
+            for s in submissions
         ],
-        "total": len(flag_mgr.suspicious_submissions)
+        "total": total,
     }
 
 
 @app.get("/admin/api/flags/mappings")
 async def admin_get_flag_mappings(_: bool = Depends(verify_admin_key)):
     """Get all flag mappings (which user has which flag for which challenge)."""
-    flag_mgr = get_flag_manager()
+    flag_mgr = await get_flag_manager()
     
     return {
         "mappings": [
@@ -981,7 +2290,7 @@ async def admin_delete_user_flags(
     _: bool = Depends(verify_admin_key)
 ):
     """Delete all flags for a user from CTFd."""
-    flag_mgr = get_flag_manager()
+    flag_mgr = await get_flag_manager()
     count = await flag_mgr.cleanup_user_flags(user_id)
     return {"success": True, "deleted": count}
 
@@ -992,31 +2301,17 @@ async def admin_delete_flag(
     _: bool = Depends(verify_admin_key)
 ):
     """Delete a specific flag mapping from CTFd."""
-    flag_mgr = get_flag_manager()
+    flag_mgr = await get_flag_manager()
     
     if flag_id not in flag_mgr.flag_mappings:
         raise HTTPException(status_code=404, detail="Flag not found")
     
     # Get mapping info before deletion
     mapping = flag_mgr.flag_mappings[flag_id]
-    
+
     # Try to delete from CTFd (but continue even if it fails)
     ctfd_deleted = await flag_mgr.delete_flag(flag_id)
-    
-    # Remove from local mappings regardless of CTFd result
-    flag_content = mapping.flag_content
-    user_id = mapping.user_id
-    local_challenge_id = mapping.local_challenge_id
-    
-    del flag_mgr.flag_mappings[flag_id]
-    if flag_content in flag_mgr.flag_lookup:
-        del flag_mgr.flag_lookup[flag_content]
-    if user_id in flag_mgr.user_flags:
-        if local_challenge_id in flag_mgr.user_flags[user_id]:
-            del flag_mgr.user_flags[user_id][local_challenge_id]
-    
-    flag_mgr._save_mappings()
-    
+
     if ctfd_deleted:
         return {"success": True, "message": f"Deleted flag {flag_id} from CTFd and local storage"}
     else:
@@ -1030,12 +2325,19 @@ async def admin_sync_challenge(
     _: bool = Depends(verify_admin_key)
 ):
     """Manually map a local challenge ID to CTFd challenge ID."""
-    flag_mgr = get_flag_manager()
-    flag_mgr.challenge_mapping[local_challenge_id] = ctfd_challenge_id
-    flag_mgr._save_mappings()
+    # Reject mapping if the challenge disables dynamic flags
+    challenge = docker_manager.get_challenge(local_challenge_id)
+    if challenge and challenge.disable_dynamic_flags:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dynamic flags are disabled for challenge '{local_challenge_id}' (set in instance.toml). Remove disable_dynamic_flags from the challenge config to enable mapping.",
+        )
+
+    flag_mgr = await get_flag_manager()
+    await flag_mgr.add_challenge_mapping(local_challenge_id, ctfd_challenge_id)
     return {
         "success": True,
-        "message": f"Mapped {local_challenge_id} -> CTFd #{ctfd_challenge_id}"
+        "message": f"Mapped {local_challenge_id} -> CTFd #{ctfd_challenge_id}",
     }
 
 
@@ -1045,16 +2347,13 @@ async def admin_delete_challenge_mapping(
     _: bool = Depends(verify_admin_key)
 ):
     """Remove a local challenge to CTFd challenge ID mapping."""
-    flag_mgr = get_flag_manager()
-    
-    if local_challenge_id in flag_mgr.challenge_mapping:
-        del flag_mgr.challenge_mapping[local_challenge_id]
-        flag_mgr._save_mappings()
+    flag_mgr = await get_flag_manager()
+    removed = await flag_mgr.remove_challenge_mapping(local_challenge_id)
+    if removed:
         return {
             "success": True,
-            "message": f"Removed mapping for {local_challenge_id}"
+            "message": f"Removed mapping for {local_challenge_id}",
         }
-    
     raise HTTPException(status_code=404, detail="Mapping not found")
 
 
@@ -1109,7 +2408,7 @@ async def admin_fetch_ctfd_challenges(
                 ]
             
             # Get current mappings for comparison
-            flag_mgr = get_flag_manager()
+            flag_mgr = await get_flag_manager()
             local_challenges = docker_manager.challenges
             
             # Build response with mapping info
@@ -1125,13 +2424,15 @@ async def admin_fetch_ctfd_challenges(
                         mapped_local_id = local_id
                         break
                 
-                # Check for name match suggestions
+                # Check for name match suggestions (skip challenges that disable dynamic flags)
                 suggested_local = None
                 name_match_score = 0
                 for local_id, local_chall in local_challenges.items():
+                    if local_chall.disable_dynamic_flags:
+                        continue  # Can't be mapped — dynamic flags disabled per challenge
                     local_name = local_chall.name.lower()
                     ctfd_name_lower = ctfd_name.lower()
-                    
+
                     # Exact match
                     if local_name == ctfd_name_lower:
                         suggested_local = local_id
@@ -1166,6 +2467,30 @@ async def admin_fetch_ctfd_challenges(
             
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Failed to connect to CTFd: {str(e)}")
+
+
+@app.get("/admin/api/ctfd/users/{user_id}")
+async def admin_resolve_ctfd_user(
+    user_id: int,
+    _: bool = Depends(verify_admin_key),
+):
+    """Resolve a CTFd user by ID. Used by the test-spawn confirmation dialog."""
+    if not settings.CTFD_URL or not settings.CTFD_API_KEY:
+        raise HTTPException(status_code=400, detail="CTFd not configured")
+
+    user = await ctfd_auth.resolve_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"CTFd user #{user_id} not found")
+
+    return {
+        "success": True,
+        "user": {
+            "id": int(user.user_id),
+            "name": user.username,
+            "team_id": user.team_id,
+            "team_name": user.team_name,
+        },
+    }
 
 
 # =============================================================================
@@ -1450,7 +2775,7 @@ async def admin_monitoring_instances(_: bool = Depends(verify_admin_key)):
 # Admin Challenge Management API
 # =============================================================================
 
-ALLOWED_EXTENSIONS = {'.py', '.js', '.ts', '.html', '.css', '.yaml', '.yml', 
+ALLOWED_EXTENSIONS = {'.py', '.js', '.ts', '.html', '.css', '.yaml', '.yml', '.toml',
                       '.json', '.txt', '.md', '.sh', '.dockerfile', '.sql',
                       '.c', '.cpp', '.h', '.go', '.rs', '.php', '.rb', '.java', '.conf'}
 BINARY_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.ico', '.woff', '.woff2', 
@@ -1504,10 +2829,10 @@ async def admin_list_challenges(_: bool = Depends(verify_admin_key)):
     if challenges_path.exists():
         for item in challenges_path.iterdir():
             if item.is_dir():
-                config_file = item / "challenge.yaml"
-                compose_yaml = item / "docker-compose.yaml"
-                compose_yml = item / "docker-compose.yml"
-                
+                config_file = item / "instance.toml"
+                compose_yaml = item / "challenge" / "docker-compose.yaml"
+                compose_yml = item / "challenge" / "docker-compose.yml"
+
                 has_config = config_file.exists()
                 has_compose = compose_yaml.exists() or compose_yml.exists()
                 
@@ -1519,9 +2844,8 @@ async def admin_list_challenges(_: bool = Depends(verify_admin_key)):
                 config_id = item.name
                 if has_config and not is_loaded:
                     try:
-                        import yaml
-                        with open(config_file) as f:
-                            cfg = yaml.safe_load(f)
+                        with open(config_file, "rb") as f:
+                            cfg = tomllib.load(f)
                             if cfg and cfg.get('id'):
                                 config_id = cfg.get('id')
                                 if config_id in loaded_ids:
@@ -1529,6 +2853,11 @@ async def admin_list_challenges(_: bool = Depends(verify_admin_key)):
                     except:
                         pass
                 
+                # Determine if this challenge disables dynamic flags
+                disable_dynamic_flags = False
+                if config_id in docker_manager.challenges:
+                    disable_dynamic_flags = docker_manager.challenges[config_id].disable_dynamic_flags
+
                 challenges.append({
                     "id": config_id,
                     "folder": item.name,
@@ -1536,7 +2865,8 @@ async def admin_list_challenges(_: bool = Depends(verify_admin_key)):
                     "has_config": has_config,
                     "has_compose": has_compose,
                     "loaded": is_loaded,
-                    "is_active": docker_manager.is_challenge_active(config_id)
+                    "is_active": docker_manager.is_challenge_active(config_id),
+                    "disable_dynamic_flags": disable_dynamic_flags,
                 })
     
     return {"challenges": challenges}
@@ -1631,20 +2961,28 @@ async def admin_upload_challenge(
         
         # Reload challenges
         docker_manager.load_challenges()
-        
+
+        # Prune flag mappings for uploaded challenges that disable dynamic flags
+        disabled_ids = docker_manager.get_disabled_flag_challenge_ids()
+        if disabled_ids:
+            flag_mgr = await get_flag_manager()
+            await flag_mgr.prune_mappings_for_disabled_challenges(disabled_ids)
+
         logger = get_event_logger()
         await logger.log(
             EventType.SYSTEM_START,
             f"Challenge uploaded: {challenge_name}",
             details={"challenge_id": challenge_name, "filename": file.filename}
         )
-        
+
+        await _broadcast_challenges_updated()
+
         return {
             "success": True,
             "message": f"Challenge '{challenge_name}' uploaded successfully",
             "challenge_id": challenge_name
         }
-    
+
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid zip file")
     except Exception as e:
@@ -1671,14 +3009,23 @@ async def admin_delete_challenge(
     try:
         shutil.rmtree(challenge_dir)
         docker_manager.load_challenges()  # Reload
-        
+
+        # Clean up flag mapping for the deleted challenge
+        flag_mgr = await get_flag_manager()
+        await flag_mgr.remove_challenge_mapping(challenge_id)
+        # Also prune any mappings for challenges that now disable dynamic flags
+        disabled_ids = docker_manager.get_disabled_flag_challenge_ids()
+        if disabled_ids:
+            await flag_mgr.prune_mappings_for_disabled_challenges(disabled_ids)
+
         logger = get_event_logger()
         await logger.log(
             EventType.SYSTEM_STOP,
             f"Challenge deleted: {challenge_id}",
             details={"challenge_id": challenge_id}
         )
-        
+
+        await _broadcast_challenges_updated()
         return {"success": True, "message": f"Challenge '{challenge_id}' deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete: {str(e)}")
@@ -1766,7 +3113,7 @@ async def admin_write_file(
         target_file.write_text(content, encoding='utf-8')
         
         # Reload if it's a config file
-        if target_file.name in ['challenge.yaml', 'challenge.yml']:
+        if target_file.name == 'instance.toml':
             docker_manager.load_challenges()
         
         return {
@@ -1822,12 +3169,21 @@ async def admin_reload_challenge(
     challenge_id: str,
     _: bool = Depends(verify_admin_key)
 ):
-    """Reload challenge configuration."""
+    """Reload challenge configuration (and clean up flag mappings for challenges that disable dynamic flags)."""
     docker_manager.load_challenges()
     await docker_manager.load_challenge_settings()
-    
+
+    # Prune flag mappings for challenges that now have dynamic flags disabled
+    disabled_ids = docker_manager.get_disabled_flag_challenge_ids()
+    if disabled_ids:
+        flag_mgr = await get_flag_manager()
+        removed = await flag_mgr.prune_mappings_for_disabled_challenges(disabled_ids)
+        if removed > 0:
+            print(f"Pruned {removed} flag mapping(s) for challenges with disabled dynamic flags")
+
     challenge = docker_manager.get_challenge(challenge_id)
     if challenge:
+        await _broadcast_challenges_updated()
         return {
             "success": True,
             "message": f"Challenge '{challenge_id}' reloaded",
@@ -1836,7 +3192,7 @@ async def admin_reload_challenge(
     else:
         return {
             "success": False,
-            "message": f"Challenge '{challenge_id}' failed to load (check challenge.yaml)"
+            "message": f"Challenge '{challenge_id}' failed to load (check instance.toml)"
         }
 
 
@@ -1886,6 +3242,7 @@ async def admin_toggle_challenge(
         details={"challenge_id": challenge_id, "is_active": is_active}
     )
     
+    await _broadcast_challenges_updated(public=True)
     return {
         "success": True,
         "message": f"Challenge '{challenge_id}' is now {status}",
@@ -1980,11 +3337,27 @@ EDITABLE_SETTINGS = {
     "FORENSICS_AUTO_CAPTURE": {"type": "bool", "label": "Forensics Auto Capture"},
     "FORENSICS_RETENTION_HOURS": {"type": "int", "min": 1, "max": 8760, "label": "Forensics Retention (hours)"},
     "PUBLIC_HOST": {"type": "str", "label": "Public Host (auto or IP/domain)"},
+
+    # Traefik Redis routing settings
+    "TRAEFIK_REDIS_ENABLED": {"type": "bool", "label": "Traefik Redis Provider Enabled"},
+    "TRAEFIK_REDIS_URL": {"type": "str", "label": "Traefik Redis URL"},
+    "TRAEFIK_BASE_DOMAIN": {"type": "str", "label": "Instance Base Domain"},
+    "TRAEFIK_BACKEND_HOST": {"type": "str", "label": "Backend Host Reachable by Traefik"},
+    "TRAEFIK_HTTP_ENTRYPOINT": {"type": "str", "label": "HTTP Entrypoint Name"},
+    "TRAEFIK_TCP_ENTRYPOINT": {"type": "str", "label": "TCP Entrypoint Name"},
+    "TRAEFIK_TCP_EXTERNAL_PORT": {"type": "int", "min": 1, "max": 65535, "label": "TCP Public Port"},
+    "TRAEFIK_HTTP_TLS_OPTIONS": {"type": "str", "label": "HTTP TLS Options Name"},
+    "TRAEFIK_TCP_TLS_OPTIONS": {"type": "str", "label": "TCP TLS Options Name"},
+    "TRAEFIK_BLOCK_ALL_ADDRESS": {"type": "str", "label": "TCP Catch-all Block Address"},
+    "TRAEFIK_DASHBOARD_USERS": {"type": "str", "label": "Dashboard BasicAuth Users (comma separated)"},
+    "TRAEFIK_PERMANENT_KEYS_FILE": {"type": "str", "label": "Permanent Traefik Keys YAML Path"},
+    "TRAEFIK_PERMANENT_KEYS_JSON": {"type": "str", "label": "Permanent Traefik Keys JSON"},
     
     # Auth and CTFd settings
     "AUTH_MODE": {"type": "select", "options": ["ctfd", "none"], "label": "Authentication Mode"},
     "CTFD_URL": {"type": "str", "label": "CTFd URL (e.g., https://ctf.example.com)"},
     "CTFD_API_KEY": {"type": "str", "label": "CTFd Admin/Access Token"},
+    "DISCORD_WEBHOOK_URL": {"type": "str", "label": "Discord Webhook URL"},
 }
 
 
@@ -2101,7 +3474,7 @@ async def admin_update_settings(
         await logger.log(
             EventType.SYSTEM_START,
             f"Settings updated: {', '.join(applied.keys())}",
-            details={"applied": {k: str(v) for k, v in applied.items()}}
+            details=_build_settings_audit_details(applied)
         )
     
     return {

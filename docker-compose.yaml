@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
@@ -16,11 +14,31 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: whaley-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-whaley}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-whaley}
+      - POSTGRES_DB=${POSTGRES_DB:-whaley}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ctf-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-whaley} -d $${POSTGRES_DB:-whaley}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   instancer:
     build: .
     container_name: ctf-instancer
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     ports:
       - "${INSTANCER_PORT:-8000}:8000"
@@ -31,7 +49,7 @@ services:
       - ./challenges:/challenges
       # Mount logs directory
       - ./logs:/app/logs
-      # Mount data directory for SQLite database
+      # Mount data directory for forensics, event logs, etc.
       - ./data:/app/data
     environment:
       - HOST=0.0.0.0
@@ -41,6 +59,9 @@ services:
       - CTFD_URL=${CTFD_URL:-https://localhost}
       - CTFD_API_KEY=${CTFD_API_KEY:-}  # Required if AUTH_MODE=ctfd
       - ADMIN_KEY=${ADMIN_KEY:-}  # Required - generate with: openssl rand -hex 32
+      - ADMIN_PATH=${ADMIN_PATH:-admin}
+      - METRICS_SECRET=${METRICS_SECRET:-}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
       - CHALLENGES_DIR=/challenges
       - PORT_RANGE_START=${PORT_RANGE_START:-10000}
       - PORT_RANGE_END=${PORT_RANGE_END:-60000}
@@ -51,11 +72,25 @@ services:
       - DYNAMIC_FLAGS_ENABLED=${DYNAMIC_FLAGS_ENABLED:-false}
       - FLAG_PREFIX=${FLAG_PREFIX:-FLAG}
       - TEAM_MODE=${TEAM_MODE:-auto}
-      # Database settings
-      - DATABASE_URL=sqlite+aiosqlite:///./data/whaley.db
+      # Database settings (PostgreSQL)
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-whaley}:${POSTGRES_PASSWORD:-whaley}@postgres:5432/${POSTGRES_DB:-whaley}
       - DATA_DIR=/app/data
       # Redis for distributed locking
       - REDIS_URL=redis://redis:6379/0
+      # Traefik Redis KV provider (shared with Traefik VM)
+      - TRAEFIK_REDIS_ENABLED=${TRAEFIK_REDIS_ENABLED:-true}
+      - TRAEFIK_REDIS_URL=${TRAEFIK_REDIS_URL:-redis://redis:6379/0}
+      - TRAEFIK_BASE_DOMAIN=${TRAEFIK_BASE_DOMAIN:-ctf.example}
+      - TRAEFIK_BACKEND_HOST=${TRAEFIK_BACKEND_HOST:-challenges-vm}
+      - TRAEFIK_HTTP_ENTRYPOINT=${TRAEFIK_HTTP_ENTRYPOINT:-websecure}
+      - TRAEFIK_TCP_ENTRYPOINT=${TRAEFIK_TCP_ENTRYPOINT:-tcp-challenges}
+      - TRAEFIK_TCP_EXTERNAL_PORT=${TRAEFIK_TCP_EXTERNAL_PORT:-5443}
+      - TRAEFIK_HTTP_TLS_OPTIONS=${TRAEFIK_HTTP_TLS_OPTIONS:-default}
+      - TRAEFIK_TCP_TLS_OPTIONS=${TRAEFIK_TCP_TLS_OPTIONS:-tcp-default}
+      - TRAEFIK_BLOCK_ALL_ADDRESS=${TRAEFIK_BLOCK_ALL_ADDRESS:-127.0.0.1:9}
+      - TRAEFIK_DASHBOARD_USERS=${TRAEFIK_DASHBOARD_USERS:-}
+      - TRAEFIK_PERMANENT_KEYS_FILE=${TRAEFIK_PERMANENT_KEYS_FILE:-}
+      - TRAEFIK_PERMANENT_KEYS_JSON=${TRAEFIK_PERMANENT_KEYS_JSON:-}
       # Network isolation
       - NETWORK_ISOLATION_ENABLED=${NETWORK_ISOLATION_ENABLED:-true}
       - NETWORK_ICC_DISABLED=${NETWORK_ICC_DISABLED:-true}
@@ -69,6 +104,8 @@ services:
     restart: unless-stopped
     networks:
       - ctf-network
+    extra_hosts:
+      - "${EXTRA_HOST_NAME:-main-vm}:${EXTRA_HOST_IP:-10.0.0.2}"  # For Traefik to route to challenges on the host network
 
 networks:
   ctf-network:
@@ -77,3 +114,4 @@ networks:
 
 volumes:
   redis_data:
+  postgres_data:

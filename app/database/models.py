@@ -85,7 +85,7 @@ class WhaleySettings(Base):
 class InstanceState(Base):
     """Active instance state for recovery and tracking."""
     __tablename__ = "instance_states"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     instance_id = Column(String(128), unique=True, nullable=False, index=True)
     challenge_id = Column(String(128), nullable=False)
@@ -102,6 +102,61 @@ class InstanceState(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
     error_message = Column(Text, nullable=True)
-    
+
     def __repr__(self):
         return f"<InstanceState(id={self.instance_id}, status={self.status})>"
+
+
+class FlagMappingModel(Base):
+    """Dynamic flag assigned to a user/team for a challenge."""
+    __tablename__ = "flag_mappings"
+
+    flag_id = Column(Integer, primary_key=True, autoincrement=False)
+    ctfd_challenge_id = Column(Integer, nullable=False)
+    local_challenge_id = Column(String(128), nullable=False, index=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    username = Column(String(255), nullable=True)
+    flag_content = Column(String(512), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    instance_id = Column(String(128), nullable=True)
+    team_id = Column(String(64), nullable=True, index=True)
+    team_name = Column(String(255), nullable=True)
+    owner_id = Column(String(64), nullable=True, index=True)
+
+    __table_args__ = (
+        Index('ix_flag_owner_challenge', 'owner_id', 'local_challenge_id'),
+        Index('ix_flag_user_challenge', 'user_id', 'local_challenge_id'),
+    )
+
+    def __repr__(self):
+        return f"<FlagMapping(flag_id={self.flag_id}, owner={self.owner_id}, challenge={self.local_challenge_id})>"
+
+
+class SuspiciousSubmissionModel(Base):
+    """Recorded suspicious submission (flag sharing attempt)."""
+    __tablename__ = "suspicious_submissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    submission_id = Column(Integer, nullable=False)
+    submitter_user_id = Column(Integer, nullable=False)
+    submitter_username = Column(String(255), nullable=True)
+    flag_owner_user_id = Column(String(64), nullable=False)
+    flag_owner_username = Column(String(255), nullable=True)
+    challenge_id = Column(Integer, nullable=False)
+    local_challenge_id = Column(String(128), nullable=False, index=True)
+    provided_flag = Column(String(512), nullable=True)
+    submission_time = Column(String(64), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    submitter_team_id = Column(String(64), nullable=True)
+    submitter_team_name = Column(String(255), nullable=True)
+    flag_owner_team_id = Column(String(64), nullable=True)
+    flag_owner_team_name = Column(String(255), nullable=True)
+    unique_key = Column(String(64), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('ix_suspicious_submission_id', 'submission_id'),
+    )
+
+    def __repr__(self):
+        return f"<SuspiciousSubmission(id={self.id}, submitter={self.submitter_username}, key={self.unique_key[:12] if self.unique_key else None})>"

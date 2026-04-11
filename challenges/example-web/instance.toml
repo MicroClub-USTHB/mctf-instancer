@@ -1,0 +1,10 @@
+id = "example-web"
+name = "Example Web Challenge"
+category = "web"
+type = "http"
+description = "A simple web exploitation challenge"
+
+ports = [80]
+timeout = 3600
+extend_time = 1800
+connection_command = "curl -s {public_url}"

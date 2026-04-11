@@ -1,11 +1,9 @@
 """Port management for dynamic port allocation with database persistence."""
-import random
+import hashlib
 import socket
-import asyncio
 from typing import Dict, Set, Optional, List
 
 from sqlalchemy import select, delete
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database.connection import get_async_session
 from .database.models import UserPortMapping
@@ -25,6 +23,12 @@ class PortManager:
         self.port_end = port_end
         self.allocated_ports: Set[int] = set()
         self.instance_ports: Dict[str, Set[int]] = {}  # instance_id -> ports
+
+        # Organized allocation strategy: deterministic lane-based distribution.
+        self._range_size = self.port_end - self.port_start + 1
+        self._lane_count = max(1, min(32, self._range_size))
+        self._lane_cursors: Dict[int, int] = {lane: 0 for lane in range(self._lane_count)}
+
         self._lock_manager = get_lock_manager()
         self._initialized = False
     
@@ -50,6 +54,79 @@ class PortManager:
                 return True
         except (socket.error, OSError):
             return False
+
+    def _is_port_in_range(self, port: int) -> bool:
+        """Validate that external port is inside configured range."""
+        return self.port_start <= port <= self.port_end
+
+    def _can_use_external_port(self, port: int) -> bool:
+        """Hard safety check before any external port allocation."""
+        if not self._is_port_in_range(port):
+            return False
+        return self._is_port_available(port)
+
+    def _reserve_port(self, instance_id: str, port: int) -> None:
+        """Reserve a validated external port for an instance."""
+        self.allocated_ports.add(port)
+        if instance_id not in self.instance_ports:
+            self.instance_ports[instance_id] = set()
+        self.instance_ports[instance_id].add(port)
+
+    def _lane_capacity(self, lane_index: int) -> int:
+        """Return how many ports exist in a specific allocation lane."""
+        if lane_index >= self._range_size:
+            return 0
+        return ((self._range_size - 1 - lane_index) // self._lane_count) + 1
+
+    def _lane_port_at(self, lane_index: int, lane_offset: int) -> int:
+        """Resolve lane offset to actual external port number."""
+        return self.port_start + lane_index + (lane_offset * self._lane_count)
+
+    def _hash_to_lane(self, user_id: str, challenge_id: str, internal_port: int) -> int:
+        """Deterministically map owner/challenge/port to a lane index."""
+        key = f"{user_id}:{challenge_id}:{internal_port}".encode("utf-8")
+        digest = hashlib.blake2b(key, digest_size=4).digest()
+        return int.from_bytes(digest, "big") % self._lane_count
+
+    def _allocate_from_lane(self, instance_id: str, lane_index: int) -> Optional[int]:
+        """Allocate the next available port in a lane, advancing lane cursor."""
+        capacity = self._lane_capacity(lane_index)
+        if capacity <= 0:
+            return None
+
+        cursor = self._lane_cursors.get(lane_index, 0) % capacity
+        for shift in range(capacity):
+            lane_offset = (cursor + shift) % capacity
+            candidate = self._lane_port_at(lane_index, lane_offset)
+            if self._can_use_external_port(candidate):
+                self._reserve_port(instance_id, candidate)
+                self._lane_cursors[lane_index] = (lane_offset + 1) % capacity
+                return candidate
+
+        return None
+
+    def _allocate_organized_port(
+        self,
+        instance_id: str,
+        user_id: str,
+        challenge_id: str,
+        internal_port: int,
+    ) -> Optional[int]:
+        """
+        Allocate in deterministic lanes (not serial and not random).
+
+        Primary lane is stable per owner/challenge/internal-port.
+        If full, walk other lanes in deterministic order.
+        """
+        primary_lane = self._hash_to_lane(user_id, challenge_id, internal_port)
+
+        for step in range(self._lane_count):
+            lane_index = (primary_lane + step) % self._lane_count
+            allocated = self._allocate_from_lane(instance_id, lane_index)
+            if allocated is not None:
+                return allocated
+
+        return None
     
     async def get_user_saved_ports(
         self, 
@@ -104,27 +181,22 @@ class PortManager:
             await session.commit()
     
     def allocate_port(self, instance_id: str) -> Optional[int]:
-        """Allocate a random available port for an instance (sync version)."""
-        available_range = list(range(self.port_start, self.port_end + 1))
-        random.shuffle(available_range)
-        
-        for port in available_range:
-            if self._is_port_available(port):
-                self.allocated_ports.add(port)
-                if instance_id not in self.instance_ports:
-                    self.instance_ports[instance_id] = set()
-                self.instance_ports[instance_id].add(port)
-                return port
-        
+        """
+        Allocate a port using lane order (organized, deterministic, non-random).
+
+        Used by generic callers without owner context.
+        """
+        for lane_index in range(self._lane_count):
+            allocated = self._allocate_from_lane(instance_id, lane_index)
+            if allocated is not None:
+                return allocated
+
         return None
     
     def allocate_specific_port(self, instance_id: str, port: int) -> bool:
         """Try to allocate a specific port for an instance."""
-        if self._is_port_available(port):
-            self.allocated_ports.add(port)
-            if instance_id not in self.instance_ports:
-                self.instance_ports[instance_id] = set()
-            self.instance_ports[instance_id].add(port)
+        if self._can_use_external_port(port):
+            self._reserve_port(instance_id, port)
             return True
         return False
     
@@ -156,51 +228,64 @@ class PortManager:
             Mapping of internal_port -> external_port, or None if failed.
         """
         lock_name = f"port:user:{user_id}:{challenge_id}"
-        
+
+        # Global allocator lock keeps the check-and-reserve sequence atomic
+        # across users and workers, preventing duplicate external allocations.
+        allocator_lock_name = "port:allocator"
+
         async with self._lock_manager.acquire(lock_name, timeout=30):
-            # Check for saved ports
-            saved_mapping = await self.get_user_saved_ports(user_id, challenge_id)
-            port_mapping: Dict[int, int] = {}
-            
-            if saved_mapping:
-                # Try to reuse saved ports
-                all_available = True
-                for internal_port in internal_ports:
-                    if internal_port in saved_mapping:
-                        saved_external = saved_mapping[internal_port]
-                        # Check port is in valid range and available
-                        if saved_external < self.port_start or saved_external > self.port_end:
+            async with self._lock_manager.acquire(allocator_lock_name, timeout=30):
+                # Check for saved ports
+                saved_mapping = await self.get_user_saved_ports(user_id, challenge_id)
+                port_mapping: Dict[int, int] = {}
+
+                if saved_mapping:
+                    # Try to reuse saved ports, but reassign immediately if any are occupied.
+                    all_available = True
+                    seen_external_ports: Set[int] = set()
+
+                    for internal_port in internal_ports:
+                        if internal_port not in saved_mapping:
                             all_available = False
                             break
+
+                        saved_external = saved_mapping[internal_port]
+                        if saved_external in seen_external_ports:
+                            all_available = False
+                            break
+
                         if self.allocate_specific_port(instance_id, saved_external):
                             port_mapping[internal_port] = saved_external
+                            seen_external_ports.add(saved_external)
                         else:
                             all_available = False
                             break
-                    else:
-                        all_available = False
-                        break
-                
-                if all_available and len(port_mapping) == len(internal_ports):
-                    # Successfully reused all saved ports
-                    return port_mapping
-                else:
-                    # Some ports unavailable, release what we got and allocate new ones
+
+                    if all_available and len(port_mapping) == len(internal_ports):
+                        # Successfully reused all saved ports
+                        return port_mapping
+
+                    # Some saved ports are missing or occupied: release and reassign.
                     self.release_instance_ports(instance_id)
                     port_mapping = {}
-            
-            # Allocate new random ports
-            for internal_port in internal_ports:
-                external_port = self.allocate_port(instance_id)
-                if external_port is None:
-                    self.release_instance_ports(instance_id)
-                    return None
-                port_mapping[internal_port] = external_port
-            
-            # Save the new mapping to database
-            await self.save_user_ports(user_id, challenge_id, port_mapping, username)
-            
-            return port_mapping
+
+                # Allocate new ports with deterministic organized distribution.
+                for internal_port in internal_ports:
+                    external_port = self._allocate_organized_port(
+                        instance_id=instance_id,
+                        user_id=user_id,
+                        challenge_id=challenge_id,
+                        internal_port=internal_port,
+                    )
+                    if external_port is None:
+                        self.release_instance_ports(instance_id)
+                        return None
+                    port_mapping[internal_port] = external_port
+
+                # Save the new mapping to database
+                await self.save_user_ports(user_id, challenge_id, port_mapping, username)
+
+                return port_mapping
     
     def release_port(self, port: int) -> None:
         """Release a single port."""

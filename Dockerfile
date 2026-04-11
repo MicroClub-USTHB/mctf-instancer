@@ -1,3 +1,13 @@
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /build/frontend
+
+COPY frontend/package*.json ./
+RUN npm ci --include=dev && npm install -D vite
+COPY frontend/ ./
+RUN npm run build
+
+
 FROM python:3.11-slim
 
 # Install Docker CLI and docker-compose plugin
@@ -21,6 +31,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app/ ./app/
+
+# Overlay compiled SPA assets into FastAPI static directory
+COPY --from=frontend-builder /build/app/static/index.html ./app/static/index.html
+COPY --from=frontend-builder /build/app/static/admin.html ./app/static/admin.html
+COPY --from=frontend-builder /build/app/static/assets ./app/static/assets
 
 # Create challenges and data directories
 RUN mkdir -p /challenges /app/data /app/logs

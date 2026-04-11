@@ -9,6 +9,8 @@ let instances = [];
 let timerIntervals = {};
 let authToken = null;
 let authMode = 'none';
+let maxInstances = 0;
+let lastAuthError = '';
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -27,9 +29,13 @@ async function init() {
     if (authMode === 'none') {
         // No auth mode - show main content directly
         showMainContent();
-        await loadUserInfo();
-        await loadChallenges();
-        await loadInstances();
+        const success = await loadUserInfo();
+        if (success) {
+            await loadChallenges();
+            await loadInstances();
+        } else {
+            showToast(lastAuthError || 'Authentication refused by server', 'error');
+        }
     } else if (authToken) {
         // CTFd mode with saved token - try to authenticate
         const success = await loadUserInfo();
@@ -40,6 +46,9 @@ async function init() {
         } else {
             // Token invalid, show auth form
             showAuthForm();
+            if (lastAuthError) {
+                showToast(lastAuthError, 'error');
+            }
         }
     } else {
         // CTFd mode without token - show auth form
@@ -97,13 +106,13 @@ async function authenticate() {
         // Save token to sessionStorage (more secure than localStorage)
         // Token will be cleared when browser/tab is closed
         sessionStorage.setItem('ctfd_token', token);
-        showToast(`Welcome, ${currentUser.username}!`, 'success');
+        showToast(`Session opened for ${currentUser.username}`, 'success');
         showMainContent();
         await loadChallenges();
         await loadInstances();
     } else {
         authToken = null;
-        showToast('Invalid token. Please check and try again.', 'error');
+        showToast(lastAuthError || 'Invalid token. Please check and try again.', 'error');
     }
 }
 
@@ -122,7 +131,7 @@ function logout() {
     // Clear token input
     document.getElementById('ctfd-token').value = '';
     
-    showToast('Logged out successfully', 'info');
+    showToast('Session closed', 'info');
     showAuthForm();
 }
 
@@ -164,12 +173,12 @@ async function checkHealth() {
         const data = await api('/health');
         statusEl.innerHTML = `
             <span class="status-dot online"></span>
-            <span>${data.challenges_loaded} challenges • ${data.active_instances} active</span>
+            <span>${data.active_instances} live</span>
         `;
     } catch (error) {
         statusEl.innerHTML = `
             <span class="status-dot offline"></span>
-            <span>Offline</span>
+            <span>Unavailable</span>
         `;
     }
 }
@@ -179,9 +188,14 @@ async function loadUserInfo() {
     try {
         const data = await api('/me');
         currentUser = data.user;
+        maxInstances = data.max_instances || 0;
+        lastAuthError = '';
         
         document.getElementById('user-name').textContent = currentUser.username;
-        document.getElementById('user-id').textContent = currentUser.user_id;
+        const userIdEl = document.getElementById('user-id');
+        if (userIdEl) {
+            userIdEl.textContent = '-';
+        }
         document.getElementById('user-instances').textContent = 
             `${data.instances} / ${data.max_instances}`;
         
@@ -190,10 +204,10 @@ async function loadUserInfo() {
         const teamNameEl = document.getElementById('team-name');
         const instancesLabel = document.getElementById('instances-label');
         
-        if (data.team_mode && currentUser.team_id) {
+        if (data.team_mode) {
             // Show team name inline
             if (teamNameItem && teamNameEl) {
-                teamNameEl.textContent = currentUser.team_name || 'No Team';
+                teamNameEl.textContent = 'Team';
                 teamNameItem.classList.remove('hidden');
             }
             
@@ -222,6 +236,7 @@ async function loadUserInfo() {
         return true;
     } catch (error) {
         console.error('Failed to load user info:', error);
+        lastAuthError = error.message || 'Failed to load user info';
         return false;
     }
 }
@@ -240,9 +255,14 @@ async function loadTeamMembers() {
         }
         
         container.classList.remove('hidden');
+
+        const teamNameEl = document.getElementById('team-name');
+        if (teamNameEl) {
+            teamNameEl.textContent = data.team_name || 'Team';
+        }
         
         const membersList = data.members.map(member => {
-            const isCurrentUser = String(member.id) === String(data.current_user_id);
+            const isCurrentUser = Boolean(member.is_current) || String(member.name).toLowerCase() === String(currentUser?.username || '').toLowerCase();
             return `<span class="team-member ${isCurrentUser ? 'current-user' : ''}">${escapeHtml(member.name)}${isCurrentUser ? ' (you)' : ''}</span>`;
         }).join('');
         
@@ -261,7 +281,7 @@ async function loadTeamMembers() {
 // Challenges
 async function loadChallenges() {
     const container = document.getElementById('challenges-list');
-    container.innerHTML = '<div class="loading">Loading challenges...</div>';
+    container.innerHTML = '<div class="loading">Loading challenge deck...</div>';
     
     try {
         const data = await api('/challenges');
@@ -270,7 +290,7 @@ async function loadChallenges() {
         if (challenges.length === 0) {
             container.innerHTML = `
                 <div class="empty-state">
-                    <span class="empty-icon">🎯</span>
+                    <span class="empty-icon">□</span>
                     <p>No challenges available</p>
                 </div>
             `;
@@ -285,11 +305,11 @@ async function loadChallenges() {
                 </div>
                 <p class="challenge-description">${escapeHtml(challenge.description || 'No description')}</p>
                 <div class="challenge-meta">
-                    <span>🔌 ${challenge.ports.length} port${challenge.ports.length !== 1 ? 's' : ''}</span>
+                    <span>${escapeHtml(challenge.routing_type || 'unknown')} routing</span>
                 </div>
                 <div class="challenge-actions">
-                    <button class="btn btn-primary" onclick="spawnInstance('${challenge.id}')">
-                        <span class="btn-icon">🚀</span> Spawn
+                    <button class="btn btn-primary" data-challenge-id="${challenge.id}" onclick="spawnInstance('${challenge.id}', this)">
+                        Deploy
                     </button>
                 </div>
             </div>
@@ -298,7 +318,7 @@ async function loadChallenges() {
     } catch (error) {
         container.innerHTML = `
             <div class="empty-state">
-                <span class="empty-icon">❌</span>
+                <span class="empty-icon">×</span>
                 <p>Failed to load challenges</p>
                 <button class="btn btn-secondary" onclick="loadChallenges()">Retry</button>
             </div>
@@ -316,7 +336,7 @@ async function loadInstances() {
         
         // Update user instance count
         document.getElementById('user-instances').textContent = 
-            `${instances.length} / ${currentUser ? 3 : '-'}`;
+            `${instances.length} / ${maxInstances || '-'}`;
         
         if (instances.length === 0) {
             // Clear any existing timers
@@ -327,9 +347,9 @@ async function loadInstances() {
             
             container.innerHTML = `
                 <div class="empty-state">
-                    <span class="empty-icon">📦</span>
+                    <span class="empty-icon">□</span>
                     <p>No active instances</p>
-                    <p class="empty-hint">Spawn a challenge above to get started!</p>
+                    <p class="empty-hint">Deploy a challenge to begin.</p>
                 </div>
             `;
             return;
@@ -337,15 +357,15 @@ async function loadInstances() {
         
         container.innerHTML = instances.map(instance => {
             // Generate URLs for all ports
-            const publicUrls = instance.public_urls || {};
+            const publicUrls = Array.isArray(instance.public_urls) ? instance.public_urls : [];
             let portsHtml;
+            const routingType = (instance.routing_type || '').toLowerCase();
             
-            if (Object.keys(publicUrls).length > 0) {
-                // Multi-port display with labels
-                portsHtml = Object.entries(publicUrls)
-                    .map(([internalPort, url]) => `
-                        <span class="instance-url" onclick="copyToClipboard('${url}')" title="Port ${internalPort} - Click to copy">
-                            <span class="port-label">:${internalPort}</span> ${url}
+            if (publicUrls.length > 0) {
+                portsHtml = publicUrls
+                    .map((url) => `
+                        <span class="instance-url" onclick="copyToClipboard('${url}')" title="Click to copy">
+                            ${url}
                         </span>
                     `).join('');
             } else {
@@ -358,27 +378,32 @@ async function loadInstances() {
                 `;
             }
             
-            // Show error message if present
-            const errorHtml = instance.error_message ? `
-                <div class="instance-error">
-                    <span class="error-icon">⚠️</span>
-                    <span class="error-msg">${escapeHtml(instance.error_message)}</span>
+            const encodedConnectionHint = instance.connection_hint
+                ? encodeURIComponent(instance.connection_hint)
+                : '';
+
+            const connectionHintHtml = instance.connection_hint ? `
+                <div class="instance-detail">
+                    <span class="label">Command:</span>
+                    <span class="instance-url" onclick="copyToClipboard(decodeURIComponent('${encodedConnectionHint}'))" title="Click to copy command">
+                        ${escapeHtml(instance.connection_hint)}
+                    </span>
                 </div>
             ` : '';
             
             // Show spawned by info in team mode (if spawned by different user)
-            const spawnedByHtml = (instance.team_id && instance.username && instance.username !== currentUser?.username) ? 
+            const spawnedByHtml = (instance.team_name && instance.username && instance.username !== currentUser?.username) ? 
                 `<span class="spawned-by">(spawned by ${escapeHtml(instance.username)})</span>` : '';
             
             return `
-                <div class="instance-card ${instance.status === 'error' ? 'instance-error-card' : ''}" data-id="${instance.instance_id}">
+                <div class="instance-card" data-id="${instance.instance_id}">
                     <div class="instance-info">
                         <div class="instance-header">
                             <span class="instance-name">${escapeHtml(instance.challenge_id)}</span>
                             <span class="instance-status status-${instance.status}">${instance.status}</span>
+                            ${routingType ? `<span class="challenge-category category-${routingType === 'http' ? 'web' : 'pwn'}">${routingType}</span>` : ''}
                             ${spawnedByHtml}
                         </div>
-                        ${errorHtml}
                         <div class="instance-details">
                             <div class="instance-detail">
                                 <span class="label">Connect:</span>
@@ -392,14 +417,15 @@ async function loadInstances() {
                                     ${formatTimeRemaining(instance.expires_at)}
                                 </span>
                             </div>
+                            ${connectionHintHtml}
                         </div>
                     </div>
                     <div class="instance-actions">
-                        <button class="btn btn-warning btn-sm" onclick="extendInstance('${instance.instance_id}')" title="Extend 30 min">
-                            <span class="btn-icon">⏰</span> Extend
+                        <button class="btn btn-warning btn-sm" onclick="extendInstance('${instance.instance_id}')" title="Request extension">
+                            Extend
                         </button>
                         <button class="btn btn-danger btn-sm" onclick="stopInstance('${instance.instance_id}')">
-                            <span class="btn-icon">🛑</span> Stop
+                            Stop
                         </button>
                     </div>
                 </div>
@@ -413,14 +439,25 @@ async function loadInstances() {
         
     } catch (error) {
         console.error('Failed to load instances:', error);
+        container.innerHTML = `
+            <div class="empty-state">
+                <span class="empty-icon">×</span>
+                <p>Failed to load instances</p>
+                <button class="btn btn-secondary" onclick="loadInstances()">Retry</button>
+            </div>
+        `;
     }
 }
 
 // Spawn Instance
-async function spawnInstance(challengeId) {
-    const btn = event.target.closest('button');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="btn-icon">⏳</span> Spawning...';
+async function spawnInstance(challengeId, triggerButton = null) {
+    const btn = triggerButton || null;
+    const originalText = btn ? btn.innerHTML : '';
+
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = 'Deploying...';
+    }
     
     try {
         const data = await api('/instances/spawn', {
@@ -431,15 +468,17 @@ async function spawnInstance(challengeId) {
         if (data.success) {
             // Build URLs message for multi-port challenges
             let urlsMsg = '';
-            const publicUrls = data.instance.public_urls || {};
-            if (Object.keys(publicUrls).length > 1) {
-                urlsMsg = Object.entries(publicUrls)
-                    .map(([port, url]) => `Port ${port}: ${url}`)
-                    .join(', ');
+            if (data.instance.connection_hint) {
+                urlsMsg = data.instance.connection_hint;
             } else {
-                urlsMsg = data.instance.public_url;
+                const publicUrls = Array.isArray(data.instance.public_urls) ? data.instance.public_urls : [];
+                if (publicUrls.length > 1) {
+                    urlsMsg = publicUrls.join(', ');
+                } else {
+                    urlsMsg = publicUrls[0] || data.instance.public_url;
+                }
             }
-            showToast(`Instance spawned! Connect at: ${urlsMsg}`, 'success');
+            showToast(`Instance deployed: ${urlsMsg}`, 'success');
             await loadInstances();
             await loadUserInfo();
         } else {
@@ -448,8 +487,10 @@ async function spawnInstance(challengeId) {
     } catch (error) {
         showToast(error.message || 'Failed to spawn instance', 'error');
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = '<span class="btn-icon">🚀</span> Spawn';
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = originalText || 'Deploy';
+        }
     }
 }
 
@@ -479,7 +520,7 @@ async function extendInstance(instanceId) {
             method: 'POST'
         });
         
-        showToast('Instance extended by 30 minutes', 'success');
+        showToast(data.message || 'Instance extended', 'success');
         await loadInstances();
     } catch (error) {
         showToast(error.message || 'Failed to extend instance', 'error');
@@ -545,9 +586,9 @@ function showToast(message, type = 'info') {
     toast.className = `toast ${type}`;
     
     const icons = {
-        success: '✅',
-        error: '❌',
-        info: 'ℹ️'
+        success: 'OK',
+        error: 'ERR',
+        info: 'INFO'
     };
     
     toast.innerHTML = `
@@ -583,6 +624,10 @@ function escapeHtml(text) {
 }
 
 function copyToClipboard(text) {
+    if (!text || text === 'N/A') {
+        return;
+    }
+
     navigator.clipboard.writeText(text).then(() => {
         showToast(`Copied: ${text}`, 'success');
     }).catch(() => {

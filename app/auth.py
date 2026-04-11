@@ -102,24 +102,267 @@ class CTFdAuth:
             print(f"Error fetching team info: {e}")
         
         return None
+
+    @staticmethod
+    def _extract_member_rows(payload) -> list:
+        """Extract a member list from different CTFd payload shapes."""
+        if isinstance(payload, list):
+            return payload
+
+        if not isinstance(payload, dict):
+            return []
+
+        for key in ("members", "users", "items", "results", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = CTFdAuth._extract_member_rows(value)
+                if nested:
+                    return nested
+
+        return []
+
+    @staticmethod
+    def _normalize_team_members(raw_members) -> list:
+        """Normalize CTFd member payloads to [{'id': ..., 'name': ...}]."""
+        rows = CTFdAuth._extract_member_rows(raw_members)
+        if not rows:
+            return []
+
+        normalized = []
+        seen = set()
+
+        for raw in rows:
+            member_id = None
+            member_name = None
+
+            if isinstance(raw, dict):
+                nested_user = {}
+                for key in ("user", "member", "account"):
+                    nested_value = raw.get(key)
+                    if isinstance(nested_value, dict):
+                        nested_user = nested_value
+                        break
+
+                candidate = nested_user or raw
+
+                member_id = (
+                    candidate.get("id")
+                    or candidate.get("user_id")
+                    or raw.get("id")
+                    or raw.get("user_id")
+                )
+                member_name = (
+                    candidate.get("name")
+                    or candidate.get("username")
+                    or candidate.get("display_name")
+                    or raw.get("name")
+                    or raw.get("username")
+                    or raw.get("display_name")
+                )
+            elif isinstance(raw, str):
+                member_name = raw
+                member_id = raw
+            elif isinstance(raw, (int, float)):
+                member_id = str(int(raw))
+                member_name = str(member_id)
+            else:
+                continue
+
+            if member_name is None and member_id is not None:
+                member_name = str(member_id)
+
+            if member_name is None:
+                continue
+
+            member_id_str = str(member_id) if member_id is not None else str(member_name)
+            member_name_str = str(member_name)
+
+            dedupe_key = (member_id_str, member_name_str)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            normalized.append({
+                "id": member_id_str,
+                "name": member_name_str,
+            })
+
+        return normalized
+
+    async def _fetch_member_payload(self, client: httpx.AsyncClient, path: str, headers: dict, params: Optional[dict] = None):
+        """Fetch and decode CTFd API payload, returning data body when successful."""
+        response = await client.get(
+            f"{self.ctfd_url}{path}",
+            headers=headers,
+            params=params,
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            return None
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+
+        if not payload.get("success"):
+            return None
+
+        return payload.get("data")
+
+    async def _resolve_member_names(self, client: httpx.AsyncClient, members: list, header_sets: list) -> list:
+        """Resolve numeric member identifiers to usernames via CTFd user endpoints."""
+        resolved = []
+        seen = set()
+
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+
+            member_id = str(member.get("id", "")).strip()
+            member_name = str(member.get("name", "")).strip()
+            looked_up = False
+
+            needs_lookup = bool(member_id) and (not member_name or member_name == member_id)
+            if needs_lookup:
+                for headers in header_sets:
+                    payload = await self._fetch_member_payload(
+                        client,
+                        f"/api/v1/users/{member_id}",
+                        headers,
+                    )
+                    if not isinstance(payload, dict):
+                        continue
+
+                    fetched_name = payload.get("name") or payload.get("username")
+                    if fetched_name:
+                        member_name = str(fetched_name).strip()
+                        looked_up = True
+                        break
+
+            if not member_name:
+                continue
+
+            # Never expose unresolved numeric IDs as names.
+            if member_id and member_name == member_id and not looked_up:
+                continue
+
+            dedupe_key = member_name.lower()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            resolved.append({
+                "id": member_id,
+                "name": member_name,
+            })
+
+        return resolved
     
     async def get_team_members(self, team_id: int, token: str) -> list:
         """Fetch team members from CTFd API."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{self.ctfd_url}/api/v1/teams/{team_id}/members",
-                    headers={
-                        "Authorization": f"Token {token}",
+                user_headers = {
+                    "Authorization": f"Token {token}",
+                    "Content-Type": "application/json"
+                }
+
+                header_sets = [user_headers]
+                if self.api_key and self.api_key != token:
+                    header_sets.append({
+                        "Authorization": f"Token {self.api_key}",
                         "Content-Type": "application/json"
-                    },
-                    timeout=10.0
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("success"):
-                        return data.get("data", [])
+                    })
+
+                for headers in header_sets:
+                    # Preferred endpoint for newer CTFd builds.
+                    payload = await self._fetch_member_payload(
+                        client,
+                        f"/api/v1/teams/{team_id}/members",
+                        headers,
+                    )
+                    members = await self._resolve_member_names(
+                        client,
+                        self._normalize_team_members(payload),
+                        header_sets,
+                    )
+                    if members:
+                        return members
+
+                    # Common fallback where members may be embedded under team details.
+                    payload = await self._fetch_member_payload(
+                        client,
+                        f"/api/v1/teams/{team_id}",
+                        headers,
+                    )
+                    members = await self._resolve_member_names(
+                        client,
+                        self._normalize_team_members(payload),
+                        header_sets,
+                    )
+                    if members:
+                        return members
+
+                    # Some CTFd builds expose current team through /teams/me.
+                    payload = await self._fetch_member_payload(
+                        client,
+                        "/api/v1/teams/me",
+                        headers,
+                    )
+                    members = await self._resolve_member_names(
+                        client,
+                        self._normalize_team_members(payload),
+                        header_sets,
+                    )
+                    if members:
+                        return members
+
+                # Final fallback using users list (works when API key has broader permissions).
+                if self.api_key:
+                    admin_headers = {
+                        "Authorization": f"Token {self.api_key}",
+                        "Content-Type": "application/json"
+                    }
+
+                    payload = await self._fetch_member_payload(
+                        client,
+                        "/api/v1/users",
+                        admin_headers,
+                        params={"per_page": 200},
+                    )
+
+                    filtered = []
+                    for item in payload if isinstance(payload, list) else []:
+                        if not isinstance(item, dict):
+                            continue
+
+                        item_team_id = item.get("team_id")
+                        if item_team_id is None or str(item_team_id) != str(team_id):
+                            continue
+
+                        member_id = item.get("id")
+                        member_name = item.get("name") or item.get("username")
+                        if member_name is None:
+                            member_name = str(member_id) if member_id is not None else None
+
+                        if member_name is None:
+                            continue
+
+                        filtered.append({
+                            "id": str(member_id) if member_id is not None else str(member_name),
+                            "name": str(member_name),
+                        })
+
+                    if filtered:
+                        members = await self._resolve_member_names(
+                            client,
+                            self._normalize_team_members(filtered),
+                            header_sets,
+                        )
+                        if members:
+                            return members
         except Exception as e:
             print(f"Error fetching team members: {e}")
         
@@ -170,6 +413,124 @@ class CTFdAuth:
                 
         except Exception as e:
             print(f"CTFd auth error: {e}")
+            return None
+
+    async def resolve_user_by_name(self, username: str) -> Optional[UserInfo]:
+        """Look up a CTFd user by name using the admin API key.
+
+        Used by the admin test-spawn flow to create an instance on behalf of a
+        specific user without requiring that user's token.
+        """
+        if not self.ctfd_url or not self.api_key:
+            print("resolve_user_by_name: CTFd URL or API key not configured")
+            return None
+
+        try:
+            async with httpx.AsyncClient() as client:
+                headers = {
+                    "Authorization": f"Token {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+
+                response = await client.get(
+                    f"{self.ctfd_url}/api/v1/users",
+                    headers=headers,
+                    params={"field": "name", "q": username},
+                    timeout=10.0,
+                )
+
+                if response.status_code != 200:
+                    print(f"resolve_user_by_name: CTFd returned {response.status_code}")
+                    return None
+
+                data = response.json()
+                if not data.get("success"):
+                    return None
+
+                users = data.get("data", [])
+                if not isinstance(users, list) or len(users) == 0:
+                    return None
+
+                # Pick the exact name match; fall back to first result
+                target = None
+                for user in users:
+                    if not isinstance(user, dict):
+                        continue
+                    name = user.get("name", "")
+                    if name.lower() == username.lower():
+                        target = user
+                        break
+                if target is None:
+                    target = users[0]
+
+                user_id = target.get("id")
+                if user_id is None:
+                    return None
+
+                team_id = target.get("team_id")
+                team_name = None
+                if team_id:
+                    team_info = await self.get_team_info(team_id, self.api_key)
+                    if team_info:
+                        team_name = team_info.get("name")
+
+                return UserInfo(
+                    user_id=str(user_id),
+                    username=target.get("name", username),
+                    team_id=str(team_id) if team_id else None,
+                    team_name=team_name,
+                )
+
+        except Exception as e:
+            print(f"resolve_user_by_name error: {e}")
+            return None
+
+    async def resolve_user_by_id(self, user_id: int) -> Optional[UserInfo]:
+        """Look up a CTFd user by numeric ID using the admin API key."""
+        if not self.ctfd_url or not self.api_key:
+            return None
+
+        try:
+            async with httpx.AsyncClient() as client:
+                headers = {
+                    "Authorization": f"Token {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+
+                response = await client.get(
+                    f"{self.ctfd_url}/api/v1/users/{user_id}",
+                    headers=headers,
+                    timeout=10.0,
+                )
+
+                if response.status_code != 200:
+                    print(f"resolve_user_by_id: CTFd returned {response.status_code}")
+                    return None
+
+                data = response.json()
+                if not data.get("success"):
+                    return None
+
+                user = data.get("data", {})
+                if not isinstance(user, dict) or not user.get("id"):
+                    return None
+
+                team_id = user.get("team_id")
+                team_name = None
+                if team_id:
+                    team_info = await self.get_team_info(team_id, self.api_key)
+                    if team_info:
+                        team_name = team_info.get("name")
+
+                return UserInfo(
+                    user_id=str(user["id"]),
+                    username=user.get("name", str(user_id)),
+                    team_id=str(team_id) if team_id else None,
+                    team_name=team_name,
+                )
+
+        except Exception as e:
+            print(f"resolve_user_by_id error: {e}")
             return None
 
 
@@ -245,8 +606,15 @@ async def get_current_user(
     x_real_ip: Optional[str] = Header(None),
 ) -> UserInfo:
     """Get the current authenticated user."""
+    team_mode_enabled = is_team_mode()
     
     if settings.AUTH_MODE == AuthMode.NONE:
+        if team_mode_enabled:
+            raise HTTPException(
+                status_code=403,
+                detail="Team mode is enabled and requires CTFd users that belong to a team. Disable TEAM_MODE or use AUTH_MODE=ctfd."
+            )
+
         # Use IP-based identification
         identifier = x_forwarded_for or x_real_ip or "anonymous"
         # Use first IP if multiple
@@ -275,6 +643,12 @@ async def get_current_user(
                 status_code=401,
                 detail="Invalid or expired CTFd access token. Please check your token and try again.",
                 headers={"WWW-Authenticate": "Bearer"}
+            )
+
+        if team_mode_enabled and not user.team_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Team mode is enabled. Only users who belong to a CTFd team can log in."
             )
         
         return user

@@ -1,0 +1,69 @@
+# Whaley instance.toml schema template (all supported features)
+# Copy this file into a challenge directory as instance.toml and customize values.
+
+id = "my-challenge-id"                 # Unique slug. Defaults to folder name if omitted.
+name = "My Challenge Name"             # Display name. Defaults to folder name if omitted.
+category = "web"                       # web | pwn | rev | crypto | misc | forensics
+description = "Short challenge summary"
+
+# Routing behavior for the instance endpoint shown to players.
+# - http: HTTPS route on TRAEFIK_HTTP_ENTRYPOINT
+# - tcp: TLS SNI route on TRAEFIK_TCP_ENTRYPOINT (shared external port)
+# - custom (example: ssh): dedicated entrypoint required
+#   set 'type' to your protocol name and provide 'entrypoint'.
+type = "http"                           # http | tcp | <custom>
+entrypoint = ""                         # Required for custom type (example: ssh-challenges)
+tls = true                               # Default: true for http/tcp, false for custom types
+tls_options = "default"                 # Optional Traefik TLS options name override
+
+# Internal service ports exposed by your docker-compose services.
+# The first port is used as the primary public endpoint in the UI/API.
+ports = [80]
+
+# Instance lifetime in seconds (default: 3600).
+timeout = 3600
+
+# Extend increment in seconds for each successful extend request.
+# Extension policy:
+# - Allowed only after at least half of timeout elapsed.
+# - Total added extension is capped at timeout (max extra time = timeout).
+extend_time = 1800
+
+# When true, dynamic flags are forcibly disabled for this challenge even if the
+# global DYNAMIC_FLAGS_ENABLED setting is on. Any existing CTFd challenge mapping
+# is automatically removed on load/reload. Use this for challenges where unique
+# per-player flags don't make sense (e.g., static demo challenges or challenges
+# where the flag is embedded in the binary itself and can't be replaced at runtime).
+disable_dynamic_flags = false
+
+# Optional custom command/snippet shown in the UI/API as connection_hint.
+# Placeholders support both {var} and ${var} syntaxes.
+# Useful variables:
+# - instance_id, challenge_id, challenge_name
+# - category, routing_type, type
+# - host, fqdn, port, public_port, backend_port, internal_port
+# - public_url, url
+# - connection_string / connection_hint / connection (default generated command), entrypoint
+#
+# Simple command for this challenge:
+# connection_command = "ssh ctf@{host} -p {port}"
+#
+# Or choose different snippets by routing/category key:
+# [connection_command]
+# default = "{connection_string}"
+# tcp = "ncat --ssl {host} {port}"
+# web = "Open {public_url}"
+# ssh = "ssh ctf@{host} -p {port}"
+
+# -----------------------------------------------------------------------------
+# Example profile: TCP challenge on shared TLS entrypoint
+# type = "tcp"
+# ports = [9999]
+# tls = true
+# tls_options = "default"
+#
+# Example profile: SSH challenge on dedicated entrypoint
+# type = "ssh"
+# entrypoint = "ssh-challenges"
+# ports = [22]
+# tls = false

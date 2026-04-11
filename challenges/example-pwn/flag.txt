@@ -1,1 +1,0 @@
-CTF{buffer_overflow_ftw}

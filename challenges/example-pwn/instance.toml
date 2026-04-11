@@ -1,0 +1,10 @@
+id = "example-pwn"
+name = "Example PWN Challenge"
+category = "pwn"
+type = "tcp"
+description = "A simple binary exploitation challenge"
+
+ports = [9999]
+timeout = 1800
+extend_time = 900
+connection_command = "ncat --ssl {host} {port}"
