@@ -96,8 +96,8 @@ This is a fork of [jonscafe/whaley](https://github.com/jonscafe/whaley), extensi
 ### Installation
 
 ```bash
-git clone https://github.com/MicroClub-USTHB/whaley.git
-cd whaley
+git clone https://github.com/MicroClub-USTHB/mctf-instancer.git
+cd mctf-instancer
 cp .env.example .env
 nano .env  # Set ADMIN_KEY, CTFD_URL, TRAEFIK_BASE_DOMAIN, etc.
 docker compose up -d
@@ -294,7 +294,7 @@ Numerous bug fixes and hardening throughout: race conditions in spawn/stop criti
   <strong>Maintained with ❤️ by <a href="https://github.com/MicroClub-USTHB">MICRO CLUB</a></strong><br>
   <sub>Powered by <a href="https://github.com/jonscafe/whaley">Whaley</a> — the original CTF Docker instancer</sub>
   <br><br>
-  <a href="https://github.com/MicroClub-USTHB/whaley">
-    <img src="https://img.shields.io/github/stars/MicroClub-USTHB/whaley?style=social" alt="GitHub stars">
+  <a href="https://github.com/MicroClub-USTHB/mctf-instancer">
+    <img src="https://img.shields.io/github/stars/MicroClub-USTHB/mctf-instancer?style=social" alt="GitHub stars">
   </a>
 </p>
