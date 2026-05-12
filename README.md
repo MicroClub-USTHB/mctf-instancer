@@ -1,4 +1,4 @@
-<h1 align="center">🐳 Whaley</h1>
+<h1 align="center"><img src="images/mctf-logo.svg" alt="MCTF Logo" height="40" style="vertical-align:middle; margin-right:8px;"/> MCTF Instancer</h1>
 <h3 align="center">Dedicated Docker Instancer for CTF Competitions</h3>
 
 <p align="center">
@@ -18,13 +18,13 @@
 
 ## 📋 Overview
 
-**Whaley** is a production-ready Docker instance manager purpose-built for **MCTF 5.0**, the flagship cybersecurity competition of [MICRO CLUB](https://github.com/MicroClub-USTHB). It provides each CTF participant with their own isolated challenge environment — complete with automatic port allocation, resource limits, dynamic Traefik routing, and CTFd integration with anti-cheat.
+**MCTF Instancer** is a production-ready Docker instance manager purpose-built for **MCTF 5.0**, the flagship cybersecurity competition of [MICRO CLUB](https://github.com/MicroClub-USTHB). It provides each CTF participant with their own isolated challenge environment — complete with automatic port allocation, resource limits, dynamic Traefik routing, and CTFd integration with anti-cheat.
 
 This is a fork of [jonscafe/whaley](https://github.com/jonscafe/whaley), extensively reworked for production-grade MCTF 5.0 operations. See [what we changed](#-what-we-built-on-top) for the full list of additions.
 
-### Why Whaley?
+### Why MCTF Instancer?
 
-| Problem | Whaley's Solution |
+| Problem | Solution |
 |---------|-------------------|
 | Shared challenge instances cause interference | 🔒 **Isolated containers** per user/team |
 | Manual reverse-proxy updates are error-prone | 🌐 **Dynamic Traefik routers via Redis KV** |
@@ -272,7 +272,7 @@ Here is what MicroClub built on top for MCTF 5.0:
 | **instance.toml config system** | Replaced the original YAML-based challenge config with a TOML schema. Added `connection_command` templates, `entrypoint`, `tls_options`, `routing_type`, and per-category command overrides. |
 | **Discord webhook notifications** | Rich embed notifications for spawn, stop, extend, and spawn-failure events with instance details, routing info, and team context. |
 | **Prometheus metrics endpoint** | 30+ metric families: instance counts by status/owner/team/challenge, spawn latency histogram, runtime operation counters, port pool utilization, flag assignment totals, suspicious submission counts. Protected by `METRICS_SECRET` Bearer token. |
-| **Runtime Settings UI** | Admin panel tab to edit 30+ Whaley settings at runtime (no file edits or restarts). Changes persist to the database and survive container restarts. Type-aware inputs, override/default badges, change tracking. |
+| **Runtime Settings UI** | Admin panel tab to edit 30+ Instancer settings at runtime (no file edits or restarts). Changes persist to the database and survive container restarts. Type-aware inputs, override/default badges, change tracking. |
 
 
 ### Reworked Systems (significantly changed from the original)
