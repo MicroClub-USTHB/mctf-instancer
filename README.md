@@ -1,4 +1,4 @@
-<h1 align="center"><img src="images/mctf-logo.svg" alt="MCTF Logo" height="40" align="middle"/> MCTF Instancer</h1>
+<h1 align="center"><img src="images/mctf-logo.svg" alt="MCTF Logo" height="45" align="absmiddle"/> MCTF Instancer</h1>
 <h3 align="center">Dedicated Docker Instancer for CTF Competitions</h3>
 
 <p align="center">
