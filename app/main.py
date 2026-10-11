@@ -43,6 +43,13 @@ from .forensics import get_forensics_manager
 from .database.connection import init_database, close_database
 from .distributed_lock import init_lock_manager, close_lock_manager
 from .traefik_redis import init_traefik_provider, close_traefik_provider
+from .sanitizers import (
+    build_settings_audit_details as _build_settings_audit_details,
+    classify_operation_failure_reason as _classify_operation_failure_reason,
+    classify_spawn_failure_reason as _classify_spawn_failure_reason,
+    is_sensitive_setting_key as _is_sensitive_setting_key,
+    sanitize_user_error_message as _sanitize_user_error_message,
+)
 
 
 # Global managers
@@ -97,62 +104,6 @@ def _normalize_reason_label(reason: Optional[str]) -> str:
     if not normalized:
         return "unknown"
     return normalized[:64]
-
-
-def _classify_spawn_failure_reason(message: str) -> str:
-    """Bucket spawn failures into low-cardinality operational reasons."""
-    lowered = (message or "").lower()
-
-    if "rate limit" in lowered:
-        return "rate_limited"
-    if "currently inactive" in lowered:
-        return "challenge_inactive"
-    if "challenge not found" in lowered:
-        return "challenge_not_found"
-    if "maximum instance" in lowered:
-        return "instance_limit_reached"
-    if "already has this challenge running" in lowered:
-        return "challenge_already_running"
-    if "no exposed ports" in lowered:
-        return "challenge_ports_missing"
-    if "no available ports" in lowered:
-        return "port_pool_exhausted"
-    if "failed to determine backend port" in lowered:
-        return "routing_backend_port_missing"
-    if "docker-compose failed" in lowered:
-        return "docker_compose_failed"
-    if "timeout" in lowered:
-        return "timeout"
-    if "failed to start instance" in lowered:
-        return "instance_start_failed"
-
-    return "unknown"
-
-
-def _classify_operation_failure_reason(message: str) -> str:
-    """Bucket stop/extend failures for alerting-friendly metrics."""
-    lowered = (message or "").lower()
-
-    if "rate limit" in lowered:
-        return "rate_limited"
-    if "instance not found" in lowered:
-        return "instance_not_found"
-    if "doesn't own this instance" in lowered or "don't own this instance" in lowered:
-        return "access_denied"
-    if "challenge configuration not found" in lowered:
-        return "challenge_config_missing"
-    if "only running instances can be extended" in lowered:
-        return "invalid_instance_state"
-    if "extension is disabled" in lowered:
-        return "extension_disabled"
-    if "extension available in" in lowered:
-        return "extension_too_early"
-    if "extension limit reached" in lowered:
-        return "extension_limit_reached"
-    if "failed to stop instance" in lowered:
-        return "instance_stop_failed"
-
-    return "unknown"
 
 
 def _record_runtime_operation(
@@ -221,64 +172,6 @@ def _to_public_instance(instance: Instance) -> PublicInstance:
         public_url=instance.public_url,
         public_urls=public_urls,
     )
-
-
-def _sanitize_user_error_message(message: str, fallback: str) -> str:
-    """Prevent leaking backend/docker internals in user-visible error details."""
-    lowered = (message or "").lower()
-    internal_markers = (
-        "docker",
-        "compose",
-        "traefik",
-        "network",
-        "traceback",
-        "port is already allocated",
-        "address already in use",
-        "failed to start instance:",
-        "failed to stop instance:",
-    )
-    if any(marker in lowered for marker in internal_markers):
-        return fallback
-    return message or fallback
-
-
-SENSITIVE_SETTING_KEYS = {
-    "ADMIN_KEY",
-    "CTFD_API_KEY",
-    "DISCORD_WEBHOOK_URL",
-}
-SENSITIVE_SETTING_KEYWORDS = (
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "WEBHOOK",
-)
-
-
-def _is_sensitive_setting_key(key: str) -> bool:
-    """Classify settings keys that should never have raw values in logs."""
-    normalized = (key or "").strip().upper()
-    if not normalized:
-        return False
-
-    if normalized in SENSITIVE_SETTING_KEYS:
-        return True
-
-    if normalized.endswith("_KEY"):
-        return True
-
-    return any(keyword in normalized for keyword in SENSITIVE_SETTING_KEYWORDS)
-
-
-def _build_settings_audit_details(applied: Dict[str, object]) -> Dict[str, object]:
-    """Build metadata-only audit details for settings updates."""
-    applied_keys = sorted(applied.keys())
-    sensitive_keys = [key for key in applied_keys if _is_sensitive_setting_key(key)]
-    return {
-        "applied_keys": applied_keys,
-        "applied_count": len(applied_keys),
-        "sensitive_keys_redacted": sensitive_keys,
-    }
 
 
 def _get_trusted_proxies() -> set:
