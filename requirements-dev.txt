@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Test + lint tooling
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+ruff>=0.6.0

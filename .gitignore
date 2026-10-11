@@ -63,9 +63,6 @@ challenges/secure-notes/
 .coverage
 htmlcov/
 
-# Test script
-tests/
-
 # Whaley Logs
 logs/*
 
