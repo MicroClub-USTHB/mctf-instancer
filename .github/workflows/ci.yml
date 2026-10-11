@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # matches the Dockerfile base image
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest
+
+      # Lint is advisory for now: the existing codebase has pre-existing
+      # pyflakes findings (mostly unused imports). Surfaced here without
+      # failing the build; flip to a hard gate once they are cleaned up.
+      - name: Lint (advisory)
+        continue-on-error: true
+        run: ruff check app/ tests/
