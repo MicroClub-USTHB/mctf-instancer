@@ -14,8 +14,8 @@ from datetime import timedelta
 import pytest
 
 from app.docker_manager import DockerManager
-from app.port_manager import PortManager
 from app.models import Instance, InstanceStatus, utcnow
+from app.port_manager import PortManager
 
 
 def make_dm():
