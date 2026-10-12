@@ -1,7 +1,6 @@
 """Main FastAPI application for the CTF Docker Instancer."""
 import hmac
 import os
-import re
 import shutil
 import zipfile
 import tempfile
@@ -47,6 +46,17 @@ from .request_utils import (
     USER_RATE_LIMIT,
     active_rate_limited_user_count,
 )
+from .metrics_state import (
+    SPAWN_LATENCY_BUCKETS_SECONDS,
+    record_runtime_operation as _record_runtime_operation,
+    spawn_started as _spawn_started,
+    spawn_finished as _spawn_finished,
+    runtime_operations_snapshot as _runtime_ops_snapshot_fn,
+    spawn_latency_bucket_snapshot as _spawn_bucket_snapshot_fn,
+    spawn_latency_count as _spawn_latency_count_fn,
+    spawn_latency_sum_seconds as _spawn_latency_sum_fn,
+    spawn_inflight_requests as _spawn_inflight_fn,
+)
 from .routers.system import router as system_router
 from .sanitizers import (
     build_settings_audit_details as _build_settings_audit_details,
@@ -73,66 +83,6 @@ _submission_check_task: Optional[asyncio.Task] = None
 SUBMISSION_CHECK_INTERVAL = 60  # Check every 60 seconds (1 minute)
 
 # Runtime metrics state for high-frequency operational observability.
-SPAWN_LATENCY_BUCKETS_SECONDS = (0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0)
-_spawn_inflight_requests = 0
-_spawn_latency_sum_seconds = 0.0
-_spawn_latency_count = 0
-_spawn_latency_bucket_counts: Dict[float, int] = defaultdict(int)
-_runtime_operation_counters: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
-
-for _spawn_bucket in SPAWN_LATENCY_BUCKETS_SECONDS:
-    _spawn_latency_bucket_counts[_spawn_bucket] = 0
-
-
-def _normalize_reason_label(reason: Optional[str]) -> str:
-    """Normalize arbitrary reason strings into stable Prometheus label values."""
-    raw_reason = (reason or "none").strip().lower()
-    if not raw_reason:
-        return "none"
-
-    normalized = re.sub(r"[^a-z0-9]+", "_", raw_reason)
-    normalized = re.sub(r"_+", "_", normalized).strip("_")
-    if not normalized:
-        return "unknown"
-    return normalized[:64]
-
-
-def _record_runtime_operation(
-    operation: str,
-    outcome: str,
-    challenge_id: Optional[str] = None,
-    reason: Optional[str] = None,
-) -> None:
-    """Track request outcomes for near-real-time SLO and failure dashboards."""
-    key = (
-        (operation or "unknown").strip().lower(),
-        (outcome or "unknown").strip().lower(),
-        _normalize_reason_label(reason),
-        str(challenge_id or "unknown"),
-    )
-    _runtime_operation_counters[key] += 1
-
-
-def _spawn_started() -> None:
-    """Track an in-flight spawn request."""
-    global _spawn_inflight_requests
-    _spawn_inflight_requests += 1
-
-
-def _spawn_finished(duration_seconds: float) -> None:
-    """Record spawn latency histogram and decrement in-flight counter."""
-    global _spawn_inflight_requests, _spawn_latency_sum_seconds, _spawn_latency_count
-
-    _spawn_inflight_requests = max(0, _spawn_inflight_requests - 1)
-    observed = max(0.0, float(duration_seconds))
-    _spawn_latency_sum_seconds += observed
-    _spawn_latency_count += 1
-
-    for bucket in SPAWN_LATENCY_BUCKETS_SECONDS:
-        if observed <= bucket:
-            _spawn_latency_bucket_counts[bucket] += 1
-
-
 def _to_public_challenge(challenge_info) -> PublicChallengeInfo:
     """Build sanitized challenge payload for normal users."""
     return PublicChallengeInfo(
@@ -731,14 +681,11 @@ async def prometheus_metrics(_: bool = Depends(verify_metrics_secret)):
     except Exception as exc:
         print(f"[Metrics] Failed to load event logger stats: {exc}")
 
-    runtime_operations_snapshot = sorted(list(_runtime_operation_counters.items()))
-    spawn_latency_bucket_snapshot = {
-        bucket: _spawn_latency_bucket_counts.get(bucket, 0)
-        for bucket in SPAWN_LATENCY_BUCKETS_SECONDS
-    }
-    spawn_latency_count = _spawn_latency_count
-    spawn_latency_sum_seconds = _spawn_latency_sum_seconds
-    spawn_inflight_requests = _spawn_inflight_requests
+    runtime_operations_snapshot = _runtime_ops_snapshot_fn()
+    spawn_latency_bucket_snapshot = _spawn_bucket_snapshot_fn()
+    spawn_latency_count = _spawn_latency_count_fn()
+    spawn_latency_sum_seconds = _spawn_latency_sum_fn()
+    spawn_inflight_requests = _spawn_inflight_fn()
 
     lines: List[str] = [
         "# HELP whaley_instances_open_total Number of open challenge instances (running or starting).",
