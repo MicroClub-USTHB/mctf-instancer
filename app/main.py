@@ -34,8 +34,6 @@ from .models import (
 )
 from .auth import get_current_user, init_auth, init_team_mode, is_team_mode, ctfd_auth, security
 from .websocket import get_ws_manager
-from .port_manager import PortManager
-from .docker_manager import DockerManager
 from .logger import get_event_logger, init_event_logger, EventType
 from .discord_webhook import get_discord_notifier
 from .flag_manager import get_flag_manager
@@ -43,6 +41,8 @@ from .forensics import get_forensics_manager
 from .database.connection import init_database, close_database
 from .distributed_lock import init_lock_manager, close_lock_manager
 from .traefik_redis import init_traefik_provider, close_traefik_provider
+from .runtime import port_manager, docker_manager, STATIC_DIR
+from .routers.system import router as system_router
 from .sanitizers import (
     build_settings_audit_details as _build_settings_audit_details,
     classify_operation_failure_reason as _classify_operation_failure_reason,
@@ -52,15 +52,6 @@ from .sanitizers import (
 )
 
 
-# Global managers
-port_manager = PortManager(
-    settings.PORT_RANGE_START, 
-    settings.PORT_RANGE_END
-)
-docker_manager = DockerManager(port_manager)
-
-# Static files directory
-STATIC_DIR = Path(__file__).parent / "static"
 
 # Rate limiting storage for admin endpoints
 # Format: {ip: [(timestamp, count), ...]}
@@ -534,6 +525,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Extracted route groups (see app/routers/).
+app.include_router(system_router)
+
 # CORS middleware
 # Note: allow_credentials=True with allow_origins=["*"] is insecure
 # If you need credentials, specify explicit origins instead of "*"
@@ -684,30 +678,6 @@ async def _broadcast_challenges_updated(public: bool = False) -> None:
     if public:
         for owner_id in list(wsm._public.keys()):
             await wsm.broadcast_to_owner(owner_id, "challenges_updated", {"timestamp": ts})
-
-
-@app.get("/")
-async def root():
-    """Serve the frontend UI."""
-    return FileResponse(str(STATIC_DIR / "index.html"))
-
-
-@app.get("/api")
-async def api_root():
-    """API health check endpoint."""
-    return {
-        "status": "ok",
-        "auth_mode": settings.AUTH_MODE
-    }
-
-
-@app.get("/health")
-async def health():
-    """Detailed health check."""
-    return {
-        "status": "healthy",
-        "active_instances": len(docker_manager.instances),
-    }
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
