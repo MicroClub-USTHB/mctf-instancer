@@ -1,0 +1,5 @@
+# Project-wide ruff config.
+[lint]
+# B008: FastAPI's `param: T = Depends(...)` is the idiomatic dependency-injection
+# pattern, not a mutable-default bug — ignore it across the codebase.
+ignore = ["B008"]
