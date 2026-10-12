@@ -7,7 +7,6 @@ import zipfile
 import tempfile
 import time
 import asyncio
-import ipaddress
 import tomllib
 from collections import defaultdict
 from pathlib import Path
@@ -42,6 +41,12 @@ from .database.connection import init_database, close_database
 from .distributed_lock import init_lock_manager, close_lock_manager
 from .traefik_redis import init_traefik_provider, close_traefik_provider
 from .runtime import port_manager, docker_manager, STATIC_DIR
+from .request_utils import (
+    get_client_ip,
+    check_user_rate_limit,
+    USER_RATE_LIMIT,
+    active_rate_limited_user_count,
+)
 from .routers.system import router as system_router
 from .sanitizers import (
     build_settings_audit_details as _build_settings_audit_details,
@@ -56,12 +61,7 @@ from .sanitizers import (
 # Rate limiting storage for admin endpoints
 # Format: {ip: [(timestamp, count), ...]}
 _admin_rate_limit: Dict[str, list] = defaultdict(list)
-
-# Rate limiting storage for user endpoints (spawn/stop/extend)
-# Format: {user_id: [timestamp, ...]}
-_user_rate_limit: Dict[str, list] = defaultdict(list)
-USER_RATE_LIMIT = 10  # Max requests per minute per user
-USER_RATE_WINDOW = 60  # 60 seconds window
+# Per-user rate limiting (spawn/stop/extend) lives in request_utils.
 
 # Maximum zip file size (50MB) and entry limits
 MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50MB
@@ -163,74 +163,6 @@ def _to_public_instance(instance: Instance) -> PublicInstance:
         public_url=instance.public_url,
         public_urls=public_urls,
     )
-
-
-def _get_trusted_proxies() -> set:
-    """Parse trusted proxies from settings."""
-    if settings.TRUSTED_PROXIES == "*":
-        return {"*"}
-    return set(p.strip() for p in settings.TRUSTED_PROXIES.split(",") if p.strip())
-
-
-def get_client_ip(request: Request) -> str:
-    """
-    Extract client IP from request with trusted proxy validation.
-    Only trusts X-Forwarded-For if the direct client is a trusted proxy.
-    """
-    direct_ip = request.client.host if request.client else "unknown"
-    trusted_proxies = _get_trusted_proxies()
-    
-    # Check if direct connection is from trusted proxy
-    is_trusted = False
-    if "*" in trusted_proxies:
-        is_trusted = True
-    elif direct_ip != "unknown":
-        try:
-            direct_addr = ipaddress.ip_address(direct_ip)
-            for proxy in trusted_proxies:
-                try:
-                    if "/" in proxy:
-                        # Network notation
-                        if direct_addr in ipaddress.ip_network(proxy, strict=False):
-                            is_trusted = True
-                            break
-                    else:
-                        if direct_addr == ipaddress.ip_address(proxy):
-                            is_trusted = True
-                            break
-                except ValueError:
-                    continue
-        except ValueError:
-            pass
-    
-    # Only trust forwarded headers if from trusted proxy
-    if is_trusted:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip
-    
-    return direct_ip
-
-
-def check_user_rate_limit(user_id: str) -> bool:
-    """
-    Check if user has exceeded rate limit for instance operations.
-    Returns True if request is allowed, False if rate limited.
-    """
-    now = time.time()
-    window_start = now - USER_RATE_WINDOW
-    
-    # Clean old entries
-    _user_rate_limit[user_id] = [t for t in _user_rate_limit[user_id] if t > window_start]
-    
-    if len(_user_rate_limit[user_id]) >= USER_RATE_LIMIT:
-        return False
-    
-    _user_rate_limit[user_id].append(now)
-    return True
 
 
 def _extract_bearer_token(authorization_header: Optional[str]) -> Optional[str]:
@@ -766,11 +698,7 @@ async def prometheus_metrics(_: bool = Depends(verify_metrics_secret)):
     port_pool_available = float(max(port_pool_total - int(port_pool_allocated), 0))
     port_pool_utilization = (port_pool_allocated / float(port_pool_total)) if port_pool_total > 0 else 0.0
 
-    active_rate_window_users = sum(
-        1
-        for timestamps in _user_rate_limit.values()
-        if any(ts > (now_ts - USER_RATE_WINDOW) for ts in timestamps)
-    )
+    active_rate_window_users = active_rate_limited_user_count()
 
     flag_manager = await get_flag_manager()
     flags_by_challenge: Dict[str, int] = defaultdict(int)
