@@ -3,7 +3,7 @@
 Kept out of main.py so route modules can render responses without importing
 main.py.
 """
-from .models import Instance, PublicInstance
+from .models import Instance, PublicChallengeInfo, PublicInstance
 
 
 def to_public_instance(instance: Instance) -> PublicInstance:
@@ -23,4 +23,16 @@ def to_public_instance(instance: Instance) -> PublicInstance:
         expires_at=instance.expires_at,
         public_url=instance.public_url,
         public_urls=public_urls,
+    )
+
+
+def to_public_challenge(challenge_info) -> PublicChallengeInfo:
+    """Build sanitized challenge payload for normal users."""
+    return PublicChallengeInfo(
+        id=challenge_info.id,
+        name=challenge_info.name,
+        category=challenge_info.category,
+        routing_type=challenge_info.routing_type,
+        tls_enabled=challenge_info.tls_enabled,
+        description=challenge_info.description,
     )
