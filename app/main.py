@@ -11,23 +11,21 @@ from collections import defaultdict
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Tuple, Any
-from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, UploadFile, File, Form, WebSocket
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, UploadFile, File, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 from .config import settings, Settings
 from .models import (
     UserInfo,
-    SpawnRequest,
     Instance,
     PublicChallengeInfo,
     PublicChallengeListResponse,
-    PublicInstance,
-    PublicInstanceListResponse,
     PublicMeResponse,
-    PublicSpawnResponse,
     PublicUserInfo,
 )
 from .auth import get_current_user, init_auth, init_team_mode, is_team_mode, ctfd_auth, security
@@ -36,21 +34,18 @@ from .logger import get_event_logger, init_event_logger, EventType
 from .discord_webhook import get_discord_notifier
 from .flag_manager import get_flag_manager
 from .forensics import get_forensics_manager
+from .monitoring import get_monitoring_manager
 from .database.connection import init_database, close_database
 from .distributed_lock import init_lock_manager, close_lock_manager
 from .traefik_redis import init_traefik_provider, close_traefik_provider
 from .runtime import port_manager, docker_manager, STATIC_DIR
 from .request_utils import (
     get_client_ip,
-    check_user_rate_limit,
-    USER_RATE_LIMIT,
     active_rate_limited_user_count,
 )
 from .metrics_state import (
     SPAWN_LATENCY_BUCKETS_SECONDS,
     record_runtime_operation as _record_runtime_operation,
-    spawn_started as _spawn_started,
-    spawn_finished as _spawn_finished,
     runtime_operations_snapshot as _runtime_ops_snapshot_fn,
     spawn_latency_bucket_snapshot as _spawn_bucket_snapshot_fn,
     spawn_latency_count as _spawn_latency_count_fn,
@@ -59,13 +54,9 @@ from .metrics_state import (
 )
 from .routers.system import router as system_router
 from .routers.instances import router as instances_router
-from .presenters import to_public_instance as _to_public_instance
 from .sanitizers import (
     build_settings_audit_details as _build_settings_audit_details,
     classify_operation_failure_reason as _classify_operation_failure_reason,
-    classify_spawn_failure_reason as _classify_spawn_failure_reason,
-    is_sensitive_setting_key as _is_sensitive_setting_key,
-    sanitize_user_error_message as _sanitize_user_error_message,
 )
 
 
@@ -260,7 +251,7 @@ async def _auto_check_submissions():
             if len(flag_manager.flag_lookup) == 0:
                 continue
             
-            print(f"[AutoCheck] Running automatic submission check...")
+            print("[AutoCheck] Running automatic submission check...")
             new_suspicious = await flag_manager.check_submissions()
             
             if new_suspicious:
@@ -268,7 +259,7 @@ async def _auto_check_submissions():
                 for sus in new_suspicious:
                     print(f"[AutoCheck] ⚠️ {sus.submitter_username} submitted flag of {sus.flag_owner_username}")
             else:
-                print(f"[AutoCheck] No new suspicious submissions found")
+                print("[AutoCheck] No new suspicious submissions found")
                 
         except asyncio.CancelledError:
             print("[AutoCheck] Submission checker stopped")
@@ -405,9 +396,6 @@ app.add_middleware(
 
 
 # Security headers middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
-
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Add security headers to all responses."""
     
@@ -451,7 +439,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 async def _ws_lifecycle_hook(event: str, instance: "Instance", **extra: Any) -> None:
     """Forward lifecycle events to WebSocket clients."""
-    from .models import Instance as InstanceModel
 
     wsm = get_ws_manager()
     instance_data = instance.model_dump()
@@ -1719,9 +1706,6 @@ async def admin_delete_flag(
     if flag_id not in flag_mgr.flag_mappings:
         raise HTTPException(status_code=404, detail="Flag not found")
     
-    # Get mapping info before deletion
-    mapping = flag_mgr.flag_mappings[flag_id]
-
     # Try to delete from CTFd (but continue even if it fails)
     ctfd_deleted = await flag_mgr.delete_flag(flag_id)
 
@@ -2079,8 +2063,6 @@ async def admin_forensics_cleanup(_: bool = Depends(verify_admin_key)):
 # Monitoring API (Resource Metrics)
 # =============================================================================
 
-from .monitoring import get_monitoring_manager
-
 
 @app.get("/admin/api/monitoring/system")
 async def admin_monitoring_system(_: bool = Depends(verify_admin_key)):
@@ -2263,7 +2245,7 @@ async def admin_list_challenges(_: bool = Depends(verify_admin_key)):
                                 config_id = cfg.get('id')
                                 if config_id in loaded_ids:
                                     is_loaded = True
-                    except:
+                    except Exception:
                         pass
                 
                 # Determine if this challenge disables dynamic flags
@@ -2906,7 +2888,7 @@ async def admin_reset_setting(
     """Reset a setting to its default (remove DB override)."""
     from .database.connection import get_async_session
     from .database.models import WhaleySettings as WhaleySettingsModel
-    from sqlalchemy import select, delete
+    from sqlalchemy import delete
     
     if key not in EDITABLE_SETTINGS:
         raise HTTPException(status_code=400, detail="Unknown setting")

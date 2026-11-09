@@ -1,5 +1,9 @@
 # Project-wide ruff config.
 [lint]
+# Pin the rule set: requirements-dev.txt allows any ruff >= 0.6, and newer ruff
+# releases enable far more rules by default (648 findings with ruff 0.17 versus
+# 35 with these rules), which would break the CI gate on an unrelated upgrade.
+select = ["E4", "E7", "E9", "F"]
 # B008: FastAPI's `param: T = Depends(...)` is the idiomatic dependency-injection
 # pattern, not a mutable-default bug — ignore it across the codebase.
 ignore = ["B008"]

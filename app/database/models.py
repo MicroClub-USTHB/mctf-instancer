@@ -1,7 +1,6 @@
 """SQLAlchemy database models for Whaley."""
 from datetime import datetime
-from typing import Optional
-from sqlalchemy import Column, Integer, String, Text, DateTime, Index, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, Index
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()

@@ -1,6 +1,6 @@
 """Authentication handlers for CTFd and no-auth modes."""
 import httpx
-from typing import Optional, Tuple
+from typing import Optional
 from fastapi import HTTPException, Header, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
