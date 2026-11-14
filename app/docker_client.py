@@ -4,13 +4,10 @@ import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
-from functools import partial
 
 try:
     import docker
     from docker.errors import DockerException, NotFound, APIError, ImageNotFound
-    from docker.models.containers import Container
-    from docker.models.networks import Network
     DOCKER_AVAILABLE = True
 except ImportError:
     DOCKER_AVAILABLE = False

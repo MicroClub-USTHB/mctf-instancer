@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 
-from .config import settings
 from .docker_client import get_docker_client
 
 
@@ -333,7 +332,7 @@ class MonitoringManager:
                     "memory_used_mb": round(mem_used, 2),
                     "memory_percent": round(mem_percent, 2)
                 }
-            except:
+            except Exception:
                 # Fallback for non-Linux or if /proc/meminfo not available
                 return {
                     "cpu_cores": cpu_cores,

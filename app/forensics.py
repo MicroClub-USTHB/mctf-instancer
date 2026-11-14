@@ -10,14 +10,11 @@ Designed with server resource protection in mind.
 import asyncio
 import gzip
 import json
-import os
-import subprocess
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
-import shutil
 
 from .config import settings
 
@@ -123,11 +120,11 @@ class ForensicsManager:
         logs = list(self._logs.values())
         
         if challenge_id:
-            logs = [l for l in logs if l.challenge_id == challenge_id]
+            logs = [log for log in logs if log.challenge_id == challenge_id]
         if owner_id:
-            logs = [l for l in logs if l.owner_id == owner_id]
+            logs = [log for log in logs if log.owner_id == owner_id]
         if capture_type:
-            logs = [l for l in logs if l.capture_type == capture_type]
+            logs = [log for log in logs if log.capture_type == capture_type]
         
         # Sort by capture time (newest first)
         logs.sort(key=lambda x: x.capture_time, reverse=True)

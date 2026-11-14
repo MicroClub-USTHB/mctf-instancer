@@ -3,12 +3,10 @@ import json
 import secrets
 import httpx
 import hashlib
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from sqlalchemy import select, delete, func
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
 from .database.connection import get_async_session

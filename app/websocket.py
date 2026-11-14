@@ -1,7 +1,6 @@
 """WebSocket connection manager with pub/sub broadcast for real-time updates."""
 
 import asyncio
-import json
 from typing import Any, Dict, List, Optional
 
 from fastapi import WebSocket

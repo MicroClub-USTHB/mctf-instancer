@@ -1,5 +1,4 @@
 """Configuration settings for the instancer."""
-import os
 import socket
 import httpx
 from typing import Optional

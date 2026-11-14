@@ -22,9 +22,5 @@ jobs:
       - name: Run tests
         run: pytest
 
-      # Lint is advisory for now: the existing codebase has pre-existing
-      # pyflakes findings (mostly unused imports). Surfaced here without
-      # failing the build; flip to a hard gate once they are cleaned up.
-      - name: Lint (advisory)
-        continue-on-error: true
+      - name: Lint
         run: ruff check app/ tests/

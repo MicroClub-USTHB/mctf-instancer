@@ -249,6 +249,14 @@ Enable with `TEAM_MODE=auto` to auto-detect from CTFd settings.
 
 Contributions welcome! Fork → feature branch → PR.
 
+Before opening a PR, run the same checks as CI (lint is a blocking step):
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+ruff check app/ tests/
+```
+
 ---
 
 ## 📄 License

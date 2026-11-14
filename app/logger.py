@@ -7,7 +7,6 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database.connection import get_async_session
 from .database.models import EventLog as EventLogModel
